@@ -9,7 +9,13 @@ live here.
 | `index.html` | The whole product: one page, no dependencies, no backend. Serve over HTTPS. |
 | `test/selfcheck.js` | Node self-check of the algorithm block inside `index.html`. Run `node test/selfcheck.js`. |
 | `test/cooper-fixture.gpx` | Copy of `PaceTool/fixtures/cooper-fixture.gpx`, replayed by the self-check. |
-| `.claude/launch.json` | Local preview server (`python -m http.server 8765`) for the in-app browser. |
+| `.claude/launch.json` | Local preview server (`python -m http.server 8765`) for the in-app browser. Not in the repo. |
+
+## Where it runs
+
+Public URL, any phone: **https://t-n-z.github.io/pacetool/** (GitHub Pages from the `main` branch
+root of `github.com/t-n-z/pacetool`, public repo, set up 2026-09-10). Deploy is `git push`; Pages
+rebuilds within about a minute. Check with `gh api repos/t-n-z/pacetool/pages/builds/latest`.
 
 ## How it is put together
 
@@ -59,8 +65,6 @@ over cached fixes.
 
 ## Not yet done
 
-- Public hosting (GitHub Pages or similar). Needs a public repo, so it waits for a go-ahead. Until
-  then: `tailscale serve` from the Linux box for phone testing on the tailnet.
 - Real-phone verification: `coords.speed` populated on the user's Android, iOS silent switch with
   `audioSession.type = "playback"`, wake lock behaviour, tone audibility at pace.
 - Optional `manifest.json` and service worker for offline load.
