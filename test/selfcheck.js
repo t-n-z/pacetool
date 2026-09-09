@@ -135,6 +135,23 @@ check('dropout: tick reports it once, gap freezes counters, ramp timer pauses', 
   assert.strictEqual(warnT, 1083, `warn at ${warnT}; 27 s RAMP before the gap + 33 s after = 60 s`);
 });
 
+check('stillness: drifting fixes while standing read as speed 0, walking and running do not', () => {
+  const core = PaceCore.create();
+  replay(core, [[20, 4.4]]);                                        // moving 4.45 m per fix
+  assert.strictEqual(core.s.still, false);
+  let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647 - 0.5;
+  for (let t = 1020; t < 1040; t++)                                 // stand still, GPS drifts up to about 1.5 m
+    core.onFix({ t, lat: 60.0408 + rnd() * 2.7e-5, lon: -30 + rnd() * 5.4e-5, speed: 0.4 + rnd() * 0.8, acc: 8 }, t);
+  assert.strictEqual(core.s.still, true, 'not detected as still');
+  assert(core.s.v < 0.05, `smoothed speed ${core.s.v} while standing`);
+  assert.strictEqual(core.s.log[core.s.log.length - 1].speed > 0, true, 'raw speed must stay in the log');
+  const walk = PaceCore.create();
+  let t = 1000, lat = 60;
+  for (; t < 1020; t++) { lat += 1.3 / 111000; walk.onFix({ t, lat, lon: -30, speed: 1.3, acc: 8 }, t); }
+  assert.strictEqual(walk.s.still, false, 'walking flagged as still');
+  assert(walk.s.v > 1.2);
+});
+
 check('manual finish: held_s counts to last fix, reason manual', () => {
   const core = PaceCore.create();
   replay(core, [[50, 4.4]]);

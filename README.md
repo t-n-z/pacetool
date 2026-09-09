@@ -37,10 +37,10 @@ over cached fixes.
 
 ## Testing without running
 
-- `node test/selfcheck.js`: 11 checks, exits 1 on failure. Covers auto-start with back-dating, the
+- `node test/selfcheck.js`: 12 checks, exits 1 on failure. Covers auto-start with back-dating, the
   asymmetric tone thresholds and glide mapping, the 46 s stop rule with a 15 s stop that must not
   end the run, ramp timeout, the accuracy and ordering gate, dropout freeze, manual finish, km
-  splits, clock-offset independence, and the GPX fixture at two targets.
+  splits, clock-offset independence, stillness detection, and the GPX fixture at two targets.
 - Simulator in the browser: open `index.html#sim` (1x) or `index.html#sim=10` (10x). Fake GPS with a
   fixed profile: 20 s ramp, 60 s at 4.5 m/s, 20 s at 4.0, 15 s at 5.0, then 2.0 m/s until the
   auto-end. At 10x the run takes about 20 s and exercises every state and tone. The simulator runs
@@ -58,6 +58,11 @@ over cached fixes.
   nothing to any counter, and the EMA still updates. One rule for gaps instead of two.
 - Glide floor: deviations under 2 semitones (about 3 %) are widened to 2 semitones so a 1 % miss
   still sounds directional. `minSemi` in `PaceCore.DEF`; 0 restores the pure spec mapping.
+- Stillness detector (not in the spec, from the first phone test 2026-09-10): if every accepted fix
+  in the last 5 s lies within 4 m of the newest, speed is taken as 0 and the display shows ∞ once
+  the smoothed speed is under 0.5 m/s. Without it, GPS drift while standing reads as 15:00 to
+  40:00/km and jumps about. `stillWindow`, `stillRadius` in `PaceCore.DEF` (tune). The raw speed
+  stays in the log.
 - Tones use one short-lived oscillator per note rather than one long-running oscillator. Simpler,
   same autoplay behaviour once the AudioContext is resumed in the Start tap.
 - End button needs a 1 s hold, in place of a separate touch-swallowing overlay. The run screen is

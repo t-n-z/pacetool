@@ -78,6 +78,7 @@ const PaceCore = (() => {
     accMax: 20, vMax: 8,
     rampTimeout: 60,  // s in RAMP before a warning tone
     dropout: 5,       // s without an accepted fix = data gap, counters frozen
+    stillWindow: 5, stillRadius: 4,   // standing still: every fix in the last 5 s within 4 m of the newest (tune)
     minSemi: 2        // ponytail: glide floor so a 1% miss still sounds directional; 0 = pure spec mapping
   };
 
@@ -109,7 +110,7 @@ const PaceCore = (() => {
     const s = {
       state: 'ARMED', v: null, dev: null, lastT: null, lastAccT: null, lastRaw: null,
       t0: null, tSlow0: null, slowS: 0, dist: 0, onPace: 0, fastRun: 0,
-      good: 0, atpace: 0, atpaceT: null, rampT0: null, dropped: false,
+      good: 0, atpace: 0, atpaceT: null, rampT0: null, dropped: false, still: false, recent: [],
       log: [], track: [], result: null
     };
 
@@ -158,6 +159,14 @@ const PaceCore = (() => {
       }
       if (s.state === 'END') return { accepted, events: ev };
 
+      // stillness: GPS drift while standing reads as 0.3 to 1 m/s; a 5 s window with no net movement beats it
+      if (f.lat != null) {
+        s.recent.push({ t: f.t, lat: f.lat, lon: f.lon });
+        s.recent = s.recent.filter(p => f.t - p.t <= c.stillWindow);
+        s.still = f.t - s.recent[0].t >= c.stillWindow - 1 && s.recent.every(p => haversine(p, f) < c.stillRadius);
+        if (s.still) speed = 0;
+      }
+
       const dtRaw = s.lastT == null ? 1 : f.t - s.lastT;
       const gap = dtRaw > c.dropout;
       const dt = gap ? 0 : dtRaw;                 // a gap freezes every counter
@@ -187,7 +196,7 @@ const PaceCore = (() => {
           if (++s.fastRun >= 3) { s.slowS = 0; s.tSlow0 = null; }
         }
       }
-      s.log.push({ t: f.t, ok: true, speed, acc: f.acc, v: s.v, dist: s.dist, gap });
+      s.log.push({ t: f.t, ok: true, speed: f.speed, acc: f.acc, v: s.v, dist: s.dist, gap, still: s.still });
       if (f.lat != null) s.track.push({ t: f.t, lat: f.lat, lon: f.lon, v: speed });
       return { accepted, events: ev };
     }
@@ -307,7 +316,7 @@ if (typeof module !== 'undefined') module.exports = PaceCore;
     if (core.tick(t) === 'dropout') dropBeep();
     const label = { ARMED: 'Waiting for GPS', RAMP: 'Get to pace', RUNNING: 'GO', END: s.result?.reason === 'auto' ? 'Ended' : 'Stopped' }[s.state];
     $('state').textContent = s.dropped ? 'GPS lost' : label;
-    $('pace').textContent = s.v ? fmtPace(1000 / s.v) : '--:--';
+    $('pace').textContent = s.v == null ? '--:--' : s.v < 0.5 ? '∞' : fmtPace(1000 / s.v);   // standing still: infinity
     $('devTxt').textContent = s.dev == null ? '' : (s.dev >= 0 ? '+' : '') + (s.dev * 100).toFixed(0) + '%';
     const held = s.state === 'RUNNING' ? (s.tSlow0 ?? s.lastT) - s.t0 : s.result ? s.result.held_s : 0;   // fix time only
     $('held').textContent = fmtT(Math.max(0, held));
