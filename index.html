@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="theme-color" content="#111">
+<title>Pace</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; background: #111; color: #eee; font-family: system-ui, sans-serif; }
+  body { padding: 16px; max-width: 480px; margin: 0 auto; }
+  h1 { font-size: 1.4rem; margin: 0 0 12px; }
+  label { display: block; margin: 12px 0 4px; color: #aaa; font-size: .9rem; }
+  input { font-size: 1.4rem; width: 100%; padding: 10px; background: #222; color: #eee; border: 1px solid #444; border-radius: 8px; }
+  button { font-size: 1.2rem; padding: 14px; width: 100%; border: 0; border-radius: 10px; background: #2b7; color: #000; font-weight: 700; margin-top: 16px; }
+  button.secondary { background: #333; color: #eee; font-weight: 400; font-size: 1rem; padding: 10px; }
+  button.danger { background: #c33; color: #fff; }
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; }
+  .hint { color: #888; font-size: .85rem; margin-top: 6px; }
+  #run { position: fixed; inset: 0; background: #111; padding: 16px; display: flex; flex-direction: column; user-select: none; touch-action: none; }
+  #run.fall { background: #401; } #run.rise { background: #032; } #run.drop { background: #330; }
+  .state { font-size: 1.1rem; color: #aaa; text-align: center; }
+  .pace { font-size: 5.5rem; font-weight: 800; text-align: center; line-height: 1.1; margin: 12px 0; font-variant-numeric: tabular-nums; }
+  .dev { font-size: 1.6rem; text-align: center; color: #ccc; }
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: auto; font-variant-numeric: tabular-nums; }
+  .stats div { background: #222; border-radius: 8px; padding: 10px; }
+  .stats b { display: block; font-size: 1.6rem; }
+  .stats span { color: #888; font-size: .8rem; }
+  ul { list-style: none; padding: 0; margin: 0; }
+  li { background: #1c1c1c; border-radius: 8px; padding: 10px; margin-top: 8px; }
+  li small { color: #888; display: block; margin-bottom: 6px; }
+  li button { margin: 0; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+
+<div id="setup">
+  <h1>Pace</h1>
+  <label>Target pace (min:sec per km)</label>
+  <input id="target" inputmode="numeric" placeholder="3:52" value="3:52">
+  <div class="row">
+    <div><label>Slow tolerance %</label><input id="under" inputmode="decimal" value="0"></div>
+    <div><label>Fast threshold %</label><input id="over" inputmode="decimal" value="10"></div>
+  </div>
+  <div class="hint">Falling tone when slower than target minus tolerance. Rising tone only when faster than target plus threshold. Silent in between.</div>
+  <button id="start">Start</button>
+  <div class="hint">Tap Start, keep the screen on and the phone in hand or on an arm. The clock starts by itself when you reach target pace and stops after about 100 m at half speed.</div>
+  <div class="hint" id="support"></div>
+  <h1 style="margin-top:24px">Runs</h1>
+  <ul id="runs"></ul>
+</div>
+
+<div id="run" hidden>
+  <div class="state" id="state">Waiting for GPS</div>
+  <div class="pace" id="pace">--:--</div>
+  <div class="dev" id="devTxt">&nbsp;</div>
+  <div class="stats">
+    <div><b id="held">0:00</b><span>held at pace</span></div>
+    <div><b id="dist">0</b><span>m</span></div>
+    <div><b id="onpace">0:00</b><span>on pace</span></div>
+    <div><b id="acc">--</b><span>GPS accuracy m</span></div>
+  </div>
+  <button id="stop" class="danger">Hold to end</button>
+</div>
+
+<!-- Pure algorithm. No DOM. test/selfcheck.js extracts and runs this block under Node. -->
+<script id="core">
+const PaceCore = (() => {
+  const DEF = {
+    targetSec: 232,   // s per km. 232 = 3:52/km = 4.31 m/s
+    tau: 3,           // EMA time constant, s
+    underTol: 0,      // falling tone when dev < -underTol
+    overThr: 0.10,    // rising tone when dev > overThr
+    stopF: 0.5, resumeF: 0.6, stopDist: 100,
+    accMax: 20, vMax: 8,
+    rampTimeout: 60,  // s in RAMP before a warning tone
+    dropout: 5,       // s without an accepted fix = data gap, counters frozen
+    minSemi: 2        // ponytail: glide floor so a 1% miss still sounds directional; 0 = pure spec mapping
+  };
+
+  function haversine(a, b) {
+    const R = 6371000, r = Math.PI / 180;
+    const dLat = (b.lat - a.lat) * r, dLon = (b.lon - a.lon) * r;
+    const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * r) * Math.cos(b.lat * r) * Math.sin(dLon / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(h));
+  }
+
+  // Which tone a deviation asks for. Returns null when silent.
+  function toneFor(dev, c) {
+    if (dev < -c.underTol) return { kind: 'fall', period: dev <= -0.10 ? 1 : 2 };
+    if (dev > c.overThr) return { kind: 'rise', period: dev >= 0.20 ? 1 : 2 };
+    return null;
+  }
+
+  // Glide end frequency for a deviation: 600 Hz * 2^(s/12), s = clamp(60*dev, -12, +12) semitones.
+  function glideHz(dev, c) {
+    let s = Math.max(-12, Math.min(12, 60 * dev));
+    if (c.minSemi && Math.abs(s) < c.minSemi) s = Math.sign(s) * c.minSemi;
+    return 600 * Math.pow(2, s / 12);
+  }
+
+  function create(opts) {
+    const c = Object.assign({}, DEF, opts);
+    const VT = 1000 / c.targetSec;
+    const STOP_S = c.stopDist / (c.stopF * VT);   // 46 s at default
+    const s = {
+      state: 'ARMED', v: null, dev: null, lastT: null, lastAccT: null, lastRaw: null,
+      t0: null, tSlow0: null, slowS: 0, dist: 0, onPace: 0, fastRun: 0,
+      good: 0, atpace: 0, atpaceT: null, rampT0: null, dropped: false,
+      log: [], track: [], result: null
+    };
+
+    function finish(tEnd, reason) {
+      if (s.state === 'END') return;
+      const t0 = s.t0 ?? tEnd;
+      const heldEnd = s.tSlow0 ?? s.lastT ?? tEnd;
+      // km splits from the per-fix (t, dist) log
+      const splits = []; let nextKm = 1000, prev = null, lastKmT = t0;
+      for (const e of s.log) {
+        if (!e.ok || e.t < t0) continue;
+        while (prev && e.dist >= nextKm) {
+          const tk = prev.t + (nextKm - prev.dist) / (e.dist - prev.dist) * (e.t - prev.t);
+          splits.push({ km: nextKm / 1000, s: Math.round(tk - lastKmT) });
+          lastKmT = tk; nextKm += 1000;
+        }
+        prev = e;
+      }
+      s.result = {
+        version: 1, reason, target_s_per_km: c.targetSec, under_tol: c.underTol, over_thr: c.overThr,
+        t0, t_end: tEnd, held_s: Math.max(0, heldEnd - t0), on_pace_s: s.onPace, dist_m: s.dist,
+        splits, track: s.track, log: s.log
+      };
+      s.state = 'END';
+      return s.result;
+    }
+
+    // f = {t (s, GPS fix timestamp), lat, lon, speed (m/s or null), acc (m)}; now = wall clock s, used
+    // only for the dropout detector. Every recorded time is a difference between fix timestamps, so the
+    // phone clock's offset from GPS time never enters the result. Fixes must arrive in time order.
+    // Returns {accepted, events:[...]} with events among 'go','end','warn'.
+    function onFix(f, now) {
+      if (now == null) now = f.t;
+      const ev = [];
+      let speed = f.speed;
+      if (speed == null && s.lastRaw && f.lat != null) {        // fallback: position differencing
+        const dt = f.t - s.lastRaw.t;
+        if (dt > 0) speed = haversine(s.lastRaw, f) / dt;
+      }
+      s.lastRaw = f;
+      const accepted = speed != null && f.acc <= c.accMax && speed <= c.vMax && (s.lastT == null || f.t > s.lastT);
+      if (!accepted) {
+        s.log.push({ t: f.t, ok: false, speed: f.speed, acc: f.acc });
+        if (s.state === 'ARMED') s.good = 0;
+        return { accepted, events: ev };
+      }
+      if (s.state === 'END') return { accepted, events: ev };
+
+      const dtRaw = s.lastT == null ? 1 : f.t - s.lastT;
+      const gap = dtRaw > c.dropout;
+      const dt = gap ? 0 : dtRaw;                 // a gap freezes every counter
+      if (gap && s.rampT0 != null) s.rampT0 += dtRaw;   // the ramp timer pauses through a gap
+      s.dropped = false;
+      s.lastT = f.t; s.lastAccT = now;
+      const a = 1 - Math.exp(-Math.min(dtRaw, 10) / c.tau);
+      s.v = s.v == null ? speed : s.v + a * (speed - s.v);
+      s.dev = (s.v - VT) / VT;
+
+      if (s.state === 'ARMED') {
+        if (++s.good >= 3) { s.state = 'RAMP'; s.rampT0 = f.t; }
+      } else if (s.state === 'RAMP') {
+        if (s.v >= (1 - c.underTol) * VT) {
+          s.atpace++; if (s.atpaceT == null) s.atpaceT = f.t;
+          if (s.atpace >= 3) { s.t0 = s.atpaceT; s.state = 'RUNNING'; ev.push('go'); }
+        } else { s.atpace = 0; s.atpaceT = null; }
+        if (s.state === 'RAMP' && f.t - s.rampT0 >= c.rampTimeout) { ev.push('warn'); s.rampT0 = f.t; }
+      } else if (s.state === 'RUNNING') {
+        s.dist += s.v * dt;
+        if (s.dev >= -c.underTol) s.onPace += dt;
+        if (s.v <= c.stopF * VT) {
+          if (s.tSlow0 == null) s.tSlow0 = f.t;
+          s.slowS += dt; s.fastRun = 0;
+          if (s.slowS >= STOP_S) { finish(f.t, 'auto'); ev.push('end'); }
+        } else if (s.v >= c.resumeF * VT) {
+          if (++s.fastRun >= 3) { s.slowS = 0; s.tSlow0 = null; }
+        }
+      }
+      s.log.push({ t: f.t, ok: true, speed, acc: f.acc, v: s.v, dist: s.dist, gap });
+      if (f.lat != null) s.track.push({ t: f.t, lat: f.lat, lon: f.lon, v: speed });
+      return { accepted, events: ev };
+    }
+
+    // Call on a timer. Returns 'dropout' once when fixes have stopped for > dropout s.
+    function tick(now) {
+      if (s.state === 'END' || s.lastAccT == null || s.dropped) return null;
+      if (now - s.lastAccT > c.dropout) { s.dropped = true; return 'dropout'; }
+      return null;
+    }
+
+    return { s, c, VT, STOP_S, onFix, tick, finish: (t) => finish(t, 'manual'),
+             tone: (dev) => toneFor(dev, c), glideHz: (dev) => glideHz(dev, c) };
+  }
+
+  return { create, haversine, toneFor, glideHz, DEF };
+})();
+if (typeof module !== 'undefined') module.exports = PaceCore;
+</script>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const LS = 'pace.runs', LSCFG = 'pace.cfg';
+  let core, ctx, watchId, wakeLock, uiTimer, toneTimer, lastGlide = 0, lastTick = 0, sim = null;
+
+  // ---- settings
+  const cfg = JSON.parse(localStorage.getItem(LSCFG) || '{}');
+  if (cfg.target) $('target').value = cfg.target;
+  if (cfg.under != null) $('under').value = cfg.under;
+  if (cfg.over != null) $('over').value = cfg.over;
+  const parseTarget = str => { const m = /^(\d+):(\d{1,2})$/.exec(str.trim()); return m ? +m[1] * 60 + +m[2] : null; };
+  const fmtPace = sPerKm => !isFinite(sPerKm) || sPerKm > 1800 ? '--:--' : `${Math.floor(sPerKm / 60)}:${String(Math.round(sPerKm % 60)).padStart(2, '0')}`;
+  const fmtT = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+
+  const missing = ['geolocation' in navigator ? '' : 'no geolocation', 'wakeLock' in navigator ? '' : 'no wake lock (screen may dim)',
+                   window.isSecureContext ? '' : 'not HTTPS: GPS will be refused'].filter(Boolean);
+  $('support').textContent = missing.join('. ');
+
+  // ---- audio
+  function note(hz, dur, at, gain = 0.4, hzEnd) {
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.type = 'sine'; o.frequency.setValueAtTime(hz, at);
+    if (hzEnd) o.frequency.exponentialRampToValueAtTime(hzEnd, at + dur);
+    g.gain.setValueAtTime(0, at); g.gain.linearRampToValueAtTime(gain, at + 0.01);
+    g.gain.setValueAtTime(gain, at + dur - 0.01); g.gain.linearRampToValueAtTime(0, at + dur);
+    o.connect(g).connect(ctx.destination); o.start(at); o.stop(at + dur + 0.02);
+  }
+  const now = () => ctx.currentTime;
+  const wall = () => sim ? sim.now() : Date.now() / 1000;   // seconds; the simulator runs its own clock
+  const glide = dev => note(600, 0.3, now(), 0.5, core.glideHz(dev));
+  const goBeep = () => { note(660, 0.12, now()); note(990, 0.2, now() + 0.15); };
+  const warnTone = () => note(220, 0.8, now());
+  const dropBeep = () => { note(880, 0.08, now()); note(880, 0.08, now() + 0.15); };
+  const endTone = () => { note(660, 0.4, now()); note(523, 0.4, now() + 0.45); note(392, 0.7, now() + 0.9); };
+  const softTick = () => note(1000, 0.02, now(), 0.08);
+
+  function toneLoop() {
+    const s = core.s, t = now();
+    let tone = null;
+    if (s.state === 'RUNNING' && !s.dropped && s.dev != null) tone = core.tone(s.dev);
+    $('run').className = s.dropped ? 'drop' : tone ? tone.kind : '';
+    if (tone) { if (t - lastGlide >= tone.period) { glide(s.dev); lastGlide = t; lastTick = t; } }
+    else if (s.state !== 'END' && !s.dropped && t - lastTick >= 4) { softTick(); lastTick = t; }
+  }
+
+  // ---- geolocation
+  function onPosition(pos) {
+    const cd = pos.coords;
+    const r = core.onFix({ t: pos.timestamp / 1000, lat: cd.latitude, lon: cd.longitude, speed: cd.speed, acc: cd.accuracy }, wall());
+    for (const e of r.events) {
+      if (e === 'go') goBeep();
+      else if (e === 'warn') warnTone();
+      else if (e === 'end') { endTone(); stopRun(); }
+    }
+    $('acc').textContent = Math.round(cd.accuracy);
+  }
+  function onError(err) { $('state').textContent = 'GPS error: ' + err.message; }
+
+  async function lock() {
+    try { wakeLock = await navigator.wakeLock?.request('screen'); } catch (e) { /* low battery or unsupported */ }
+  }
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && core && core.s.state !== 'END') lock(); });
+
+  // ---- run lifecycle
+  function start() {
+    const targetSec = parseTarget($('target').value);
+    if (!targetSec) { alert('Target pace as min:sec, for example 3:52'); return; }
+    const underTol = Math.max(0, +$('under').value || 0) / 100, overThr = Math.max(0, +$('over').value || 0) / 100;
+    localStorage.setItem(LSCFG, JSON.stringify({ target: $('target').value.trim(), under: $('under').value, over: $('over').value }));
+    core = PaceCore.create({ targetSec, underTol, overThr });
+
+    ctx = ctx || new (window.AudioContext || window.webkitAudioContext)();
+    if ('audioSession' in navigator) { try { navigator.audioSession.type = 'playback'; } catch (e) {} }  // iOS silent switch
+    ctx.resume(); lastGlide = lastTick = 0;
+    lock();
+    if (sim) sim.start(onPosition);
+    else watchId = navigator.geolocation.watchPosition(onPosition, onError, { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 });   // maximumAge 0: no cached fixes
+
+    $('setup').hidden = true; $('run').hidden = false;
+    uiTimer = setInterval(render, 250);
+    toneTimer = setInterval(toneLoop, 100);
+  }
+
+  function stopRun() {
+    if (core.s.state !== 'END') core.finish(wall());
+    clearInterval(uiTimer); clearInterval(toneTimer);
+    if (sim) sim.stop(); else navigator.geolocation.clearWatch(watchId);
+    wakeLock?.release(); wakeLock = null;
+    saveRun(core.s.result);
+    render();
+    setTimeout(() => { $('run').hidden = true; $('setup').hidden = false; renderRuns(); }, 2500);
+  }
+
+  function render() {
+    const s = core.s, t = wall();
+    if (core.tick(t) === 'dropout') dropBeep();
+    const label = { ARMED: 'Waiting for GPS', RAMP: 'Get to pace', RUNNING: 'GO', END: s.result?.reason === 'auto' ? 'Ended' : 'Stopped' }[s.state];
+    $('state').textContent = s.dropped ? 'GPS lost' : label;
+    $('pace').textContent = s.v ? fmtPace(1000 / s.v) : '--:--';
+    $('devTxt').textContent = s.dev == null ? '' : (s.dev >= 0 ? '+' : '') + (s.dev * 100).toFixed(0) + '%';
+    const held = s.state === 'RUNNING' ? (s.tSlow0 ?? s.lastT) - s.t0 : s.result ? s.result.held_s : 0;   // fix time only
+    $('held').textContent = fmtT(Math.max(0, held));
+    $('dist').textContent = Math.round(s.dist);
+    $('onpace').textContent = fmtT(s.onPace);
+  }
+
+  // hold 1 s to end, so a bump does not stop the run
+  let holdT;
+  $('stop').addEventListener('pointerdown', () => { holdT = setTimeout(() => { endTone(); stopRun(); }, 1000); });
+  for (const e of ['pointerup', 'pointerleave', 'pointercancel']) $('stop').addEventListener(e, () => clearTimeout(holdT));
+  $('start').addEventListener('click', start);
+
+  // ---- storage and export
+  const loadRuns = () => JSON.parse(localStorage.getItem(LS) || '[]');
+  function saveRun(r) {
+    const runs = loadRuns(); runs.unshift(r);
+    try { localStorage.setItem(LS, JSON.stringify(runs)); } catch (e) { alert('Could not save run (storage full). Export older runs and delete them.'); }
+  }
+  async function exportRun(r) {
+    const name = 'pace-' + new Date(r.t0 * 1000).toISOString().slice(0, 16).replace(/[:T]/g, '-') + '.json';
+    const file = new File([JSON.stringify(r)], name, { type: 'application/json' });
+    if (navigator.canShare?.({ files: [file] })) { try { await navigator.share({ files: [file], title: name }); return; } catch (e) { if (e.name === 'AbortError') return; } }
+    const a = document.createElement('a'); a.href = URL.createObjectURL(file); a.download = name; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  }
+  function renderRuns() {
+    const runs = loadRuns(); const ul = $('runs'); ul.innerHTML = '';
+    runs.forEach((r, i) => {
+      const li = document.createElement('li');
+      li.innerHTML = `<small>${new Date(r.t0 * 1000).toLocaleString()} at ${fmtPace(r.target_s_per_km)}/km, ${r.reason}</small>
+        <b>${fmtT(r.held_s)}</b> held, ${fmtT(r.on_pace_s)} on pace, ${Math.round(r.dist_m)} m
+        ${r.splits.map(x => ` · km ${x.km} ${fmtT(x.s)}`).join('')}
+        <div class="row"><button class="secondary">Export</button><button class="secondary">Delete</button></div>`;
+      const [ex, del] = li.querySelectorAll('button');
+      ex.onclick = () => exportRun(r);
+      del.onclick = () => { if (confirm('Delete this run?')) { runs.splice(i, 1); localStorage.setItem(LS, JSON.stringify(runs)); renderRuns(); } };
+      ul.appendChild(li);
+    });
+  }
+  renderRuns();
+
+  // ---- simulator: open pace.html#sim (or #sim=10 for 10x speed) to test without GPS.
+  // Profile: 20 s ramp, 60 s on pace, 20 s slow, 15 s fast, then jog at 2 m/s until auto-end.
+  // Simulated seconds tick once per fix, so at 10x the whole run takes about 20 real seconds.
+  if (location.hash.startsWith('#sim')) {
+    const rate = +(location.hash.split('=')[1]) || 1;
+    const profile = t => t < 20 ? 1 + t * 0.18 : t < 80 ? 4.5 : t < 100 ? 4.0 : t < 115 ? 5.0 : 2.0;
+    let timer, k = 0, lat = 60.18, lon = -30.03; const t0 = Math.floor(Date.now() / 1000);
+    sim = {
+      now: () => t0 + k,
+      start(cb) { timer = setInterval(() => {
+        const v = profile(k) + (Math.random() - 0.5) * 0.3; lat += v / 111000; k++;
+        cb({ timestamp: (t0 + k) * 1000, coords: { latitude: lat, longitude: lon, speed: v, accuracy: 8 } });
+      }, 1000 / rate); },
+      stop() { clearInterval(timer); }
+    };
+    $('support').textContent = 'SIMULATOR: fake GPS at ' + rate + 'x';
+  }
+})();
+</script>
+</body>
+</html>
