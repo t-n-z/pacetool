@@ -28,6 +28,13 @@
   .row { display: flex; gap: 8px; }
   .row > * { flex: 1; }
   .hint { color: #888; font-size: .85rem; margin-top: 6px; }
+  /* The instructions live behind these. Small, round, and never the full-width button the generic
+     rule would make it. */
+  .info { display: inline-flex; align-items: center; justify-content: center;
+    width: 22px; height: 22px; flex: 0 0 22px; margin: 0 0 0 8px; padding: 0; border-radius: 50%;
+    background: #333; color: #8bd; font: italic 700 .8rem/1 Georgia, 'Times New Roman', serif;
+    vertical-align: middle; }
+  .info[aria-expanded="true"] { background: #2b7; color: #000; }
   .check { display: flex; align-items: center; gap: 10px; color: #eee; font-size: 1rem; margin: 16px 0 0; }
   .countdown { font-size: 2.6rem; font-weight: 700; text-align: center; color: #eee; font-variant-numeric: tabular-nums; margin-top: 6px; }
   .countdown.low { color: #f85; }
@@ -55,38 +62,41 @@
 <body>
 
 <div id="setup">
-  <h1>Pace</h1>
-  <label>Target pace (min:sec per km)</label>
+  <h1>Pace <button class="info" type="button" data-for="hintStart" aria-expanded="false" aria-label="How to use this">i</button></h1>
+  <div class="hint" id="hintStart" hidden>Set a target pace, then tap Start and build up. The clock starts by itself
+    when you first reach the target and is back-dated to that moment. It ends after about 100 m at half speed, or when
+    the countdown runs out. Keep the screen on and the phone in your hand or on your arm: a browser stops receiving GPS
+    the moment the screen goes off.</div>
+  <label>Target pace (min:sec per km) <button class="info" type="button" data-for="hintTarget" aria-expanded="false" aria-label="About target pace">i</button></label>
   <div class="targetRow">
     <input id="target" inputmode="numeric" autocomplete="off" placeholder="3:52" value="3:52">
     <button id="targetClear" type="button" title="Clear" aria-label="Clear target pace">&times;</button>
   </div>
-  <div class="hint">Type digits only: 3 then 5 then 2 gives 3:52. Seconds past 59 carry into minutes. The cross clears it.</div>
+  <div class="hint" id="hintTarget" hidden>Type digits only: 3 then 5 then 2 gives 3:52. Seconds past 59 carry into minutes. The cross clears it.</div>
   <div class="row">
-    <div><label>Slow tolerance %</label><input id="under" inputmode="decimal" value="10"></div>
+    <div><label>Slow tolerance % <button class="info" type="button" data-for="hintTones" aria-expanded="false" aria-label="About the tones">i</button></label><input id="under" inputmode="decimal" value="10"></div>
     <div><label>Fast threshold %</label><input id="over" inputmode="decimal" value="10"></div>
   </div>
-  <div class="hint">Falling tone when slower than target minus tolerance. Rising tone only when faster than target plus threshold. Silent in between. The tolerances move the tones only: the clock still starts at target pace and time on pace still counts only at or above it.</div>
+  <div class="hint" id="hintTones" hidden>Falling tone when slower than target minus tolerance. Rising tone only when faster than target plus threshold. Silent in between. The tolerances move the tones only: the clock still starts at target pace and time on pace still counts only at or above it.</div>
 
-  <label>Countdown (min:sec, blank for none)</label>
+  <label>Countdown (min:sec, blank for none) <button class="info" type="button" data-for="hintCountdown" aria-expanded="false" aria-label="About the countdown">i</button></label>
   <div class="targetRow">
     <input id="limit" inputmode="numeric" autocomplete="off" placeholder="none" value="">
     <button id="limitClear" type="button" title="Clear" aria-label="Clear countdown">&times;</button>
   </div>
-  <div class="hint">Same digit entry: 1, 2, 0, 0 gives 12:00. Left blank there is no countdown. The countdown starts when the clock does, at target pace, and ends the run when it runs out.</div>
+  <div class="hint" id="hintCountdown" hidden>Same digit entry: 1, 2, 0, 0 gives 12:00. Left blank there is no countdown. The countdown starts when the clock does, at target pace, and ends the run when it runs out.</div>
 
-  <label>Voice every (metres, blank for none)</label>
+  <label>Voice every (metres, blank for none) <button class="info" type="button" data-for="voiceHint" aria-expanded="false" aria-label="About the voice">i</button></label>
   <div class="targetRow">
     <input id="voice" inputmode="numeric" autocomplete="off" placeholder="none" value="">
     <button id="voiceClear" type="button" title="Clear" aria-label="Clear voice increment">&times;</button>
   </div>
-  <div class="hint" id="voiceHint"></div>
+  <div class="hint" id="voiceHint" hidden></div>
 
   <label class="check"><input type="checkbox" id="cadOn"> Cadence metronome</label>
-  <div class="row"><div><label>Steps per minute</label><input id="cadSpm" inputmode="numeric" value="170"></div></div>
-  <div class="hint" id="cadHint"></div>
+  <div class="row"><div><label>Steps per minute <button class="info" type="button" data-for="cadHint" aria-expanded="false" aria-label="About the metronome">i</button></label><input id="cadSpm" inputmode="numeric" value="170"></div></div>
+  <div class="hint" id="cadHint" hidden></div>
   <button id="start">Start</button>
-  <div class="hint">Tap Start, keep the screen on and the phone in hand or on an arm. The clock starts by itself when you reach target pace and stops after about 100 m at half speed.</div>
   <div class="hint" id="support"></div>
   <h1 style="margin-top:24px">Runs</h1>
   <ul id="runs"></ul>
@@ -107,10 +117,10 @@
 </div>
 
 <div id="detail" hidden>
-  <h1 id="detailTitle">Run</h1>
+  <h1><span id="detailTitle">Run</span> <button class="info" type="button" data-for="hintChart" aria-expanded="false" aria-label="About this chart">i</button></h1>
   <div id="detailStats"></div>
   <div id="detailChart"></div>
-  <div class="legend">Bright line: the smoothed pace the tones used. Faint line: the raw fix-by-fix speed. Dashed: target. The vertical mark is where the clock started.</div>
+  <div class="legend hint" id="hintChart" hidden>Bright line: the smoothed pace the tones used. Faint line: the raw fix-by-fix speed. Dashed: target. The vertical mark is where the clock started. The scale runs from half to one and a half times target pace.</div>
   <button id="detailClose" class="secondary">Close</button>
 </div>
 
@@ -457,6 +467,18 @@ if (typeof module !== 'undefined') module.exports = PaceCore;
   addEventListener('pageshow', () => { setDigits($('target').value || cfg.target || '3:52'); setLimit($('limit').value); });
   const fmtPace = sPerKm => !isFinite(sPerKm) || sPerKm > 1800 ? '--:--' : `${Math.floor(sPerKm / 60)}:${String(Math.round(sPerKm % 60)).padStart(2, '0')}`;
   const fmtT = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+
+  // Instructions are collapsed behind a small i so the setup screen stays short. data-for names the
+  // block, so a new setting cannot accidentally inherit the wrong one.
+  for (const b of document.querySelectorAll('.info')) {
+    const tip = $(b.dataset.for);
+    b.setAttribute('aria-controls', b.dataset.for);
+    b.addEventListener('click', e => {
+      e.preventDefault(); e.stopPropagation();          // some of these sit inside a <label>
+      tip.hidden = !tip.hidden;
+      b.setAttribute('aria-expanded', String(!tip.hidden));
+    });
+  }
 
   const missing = ['geolocation' in navigator ? '' : 'no geolocation', 'wakeLock' in navigator ? '' : 'no wake lock (screen may dim)',
                    window.isSecureContext ? '' : 'not HTTPS: GPS will be refused'].filter(Boolean);

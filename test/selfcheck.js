@@ -390,6 +390,36 @@ check('the clear crosses are square, small, and every one of them is covered by 
   for (const id of ids) assert(selector.includes('#' + id), `#${id} is not covered by the clear-button rule`);
 });
 
+check('every instruction block is collapsed behind its own i, and none is orphaned', () => {
+  // The setup screen is short because the instructions are hidden behind small i buttons. This reads
+  // index.html so a later setting cannot leave its text permanently on screen, or point an i at a
+  // block that no longer exists.
+  // markup only: the script also builds .hint divs for run data, which are not instructions
+  const markup = html.slice(0, html.indexOf('<script id="core">'));
+  const blocks = [...markup.matchAll(/<div class="[^"]*hint[^"]*"([^>]*)>/g)].map(m => m[1]);
+  const ids = blocks.map(a => (/id="([^"]+)"/.exec(a) || [])[1]);
+  assert(ids.length >= 7, `only ${ids.length} instruction blocks found`);
+  for (let i = 0; i < blocks.length; i++) {
+    if (ids[i] === 'support') {                      // the capability warning is not an instruction
+      assert(!/\bhidden\b/.test(blocks[i]), 'the support warning must stay visible');
+      continue;
+    }
+    assert(ids[i], `an instruction block has no id: ${blocks[i]}`);
+    assert(/\bhidden\b/.test(blocks[i]), `#${ids[i]} is not hidden, so its text is always on screen`);
+    const buttons = [...markup.matchAll(new RegExp('data-for="' + ids[i] + '"', 'g'))];
+    assert.strictEqual(buttons.length, 1, `#${ids[i]} has ${buttons.length} i buttons, expected exactly one`);
+  }
+  for (const m of markup.matchAll(/data-for="([^"]+)"/g))
+    assert(ids.includes(m[1]), `an i points at #${m[1]}, which does not exist`);
+  // the buttons must be real buttons that do not submit or steal the label's click
+  for (const m of markup.matchAll(/<button class="info"([^>]*)>/g)) {
+    assert(/type="button"/.test(m[1]), 'an i is missing type="button"');
+    assert(/aria-expanded="false"/.test(m[1]), 'an i must start collapsed and say so');
+    assert(/aria-label="[^"]+"/.test(m[1]), 'an i needs a label: "i" alone means nothing to a screen reader');
+  }
+  assert(markup.includes('<div id="setup">'), 'no setup screen');
+});
+
 check('manual finish: held_s counts to last fix, reason manual', () => {
   const core = PaceCore.create();
   replay(core, [[50, 4.4]]);

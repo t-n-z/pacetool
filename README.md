@@ -38,13 +38,13 @@ over cached fixes.
 
 ## Testing without running
 
-- `node test/selfcheck.js`: 22 checks, exits 1 on failure. Covers auto-start with back-dating, the
+- `node test/selfcheck.js`: 23 checks, exits 1 on failure. Covers auto-start with back-dating, the
   asymmetric tone thresholds and glide mapping, the 46 s stop rule with a 15 s stop that must not
   end the run, ramp timeout, the accuracy and ordering gate, dropout freeze, manual finish, km
   splits, clock-offset independence, stillness detection, the tone hold, target-pace entry,
   tolerance independence of the clock, the countdown (including ending when GPS has stopped), the
   chart geometry and scale, the voice markers and their spoken phrasing, the clear-button styling,
-  and the GPX fixture at two targets. Several were written by mutation: break the code, watch the check fail, put it back.
+  the collapsed instructions, and the GPX fixture at two targets. Several were written by mutation: break the code, watch the check fail, put it back.
 - Simulator in the browser: open `index.html#sim` (1x) or `index.html#sim=10` (10x). Fake GPS with a
   fixed profile: 20 s ramp, 60 s at 4.5 m/s, 20 s at 4.0, 15 s at 5.0, then 2.0 m/s until the
   auto-end. At 10x the run takes about 20 s and exercises every state and tone. The simulator runs
@@ -164,6 +164,12 @@ three independent skeptics told to refute it. 26 findings, 10 survived. What the
 - Target pace entry is digits-only (added 2026-09-15). A phone's numeric keypad has no colon, so
   digits shift in from the right like a stopwatch: 3, 5, 2 gives 3:52, a fourth digit pushes the rest
   left, seconds past 59 carry into minutes, and the cross clears. `PaceCore.paceDigits`.
+- Instructions are collapsed behind small round i buttons (2026-09-16), one per setting, all closed
+  on load. The setup screen went from about 1,570 px of content to 745 px on a 375 px phone, so Start
+  is now above the fold. `data-for` names the block each i opens, rather than relying on where it
+  sits in the document, and a self-check asserts every instruction block is hidden, has exactly one i
+  pointing at it, and that no i points at a block that no longer exists. The capability warning under
+  Start is not an instruction and stays visible.
 - The clear crosses are fixed 48 px squares (2026-09-15): `flex: 0 0 48px` with a matching height, so
   a row can neither stretch them wide nor shrink them, and 48 px is the smallest comfortable touch
   target on both platforms. One self-check reads the stylesheet and asserts the rule is square, small,
