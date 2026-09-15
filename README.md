@@ -38,11 +38,13 @@ over cached fixes.
 
 ## Testing without running
 
-- `node test/selfcheck.js`: 15 checks, exits 1 on failure. Covers auto-start with back-dating, the
+- `node test/selfcheck.js`: 21 checks, exits 1 on failure. Covers auto-start with back-dating, the
   asymmetric tone thresholds and glide mapping, the 46 s stop rule with a 15 s stop that must not
   end the run, ramp timeout, the accuracy and ordering gate, dropout freeze, manual finish, km
   splits, clock-offset independence, stillness detection, the tone hold, target-pace entry,
-  tolerance independence of the clock, and the GPX fixture at two targets.
+  tolerance independence of the clock, the countdown (including ending when GPS has stopped), the
+  chart geometry and scale, the voice markers and their spoken phrasing, and the GPX fixture at two
+  targets. Several were written by mutation: break the code, watch the check fail, put it back.
 - Simulator in the browser: open `index.html#sim` (1x) or `index.html#sim=10` (10x). Fake GPS with a
   fixed profile: 20 s ramp, 60 s at 4.5 m/s, 20 s at 4.0, 15 s at 5.0, then 2.0 m/s until the
   auto-end. At 10x the run takes about 20 s and exercises every state and tone. The simulator runs
@@ -113,6 +115,29 @@ look like 20x rather than 4x. It is now a time: a tone state must persist for 3 
 fixes. At 1 Hz that is what it always was, and a phone delivering fixes slowly no longer turns it
 into a long silence.
 
+## What the multi-agent review found
+
+The countdown and chart were reviewed by 82 agents across four dimensions, every finding then put to
+three independent skeptics told to refute it. 26 findings, 10 survived. What they caught, all fixed:
+
+- **The countdown quietly broke the project's cornerstone rule.** Capping the held time at the end of
+  the run was right for a countdown end, but the manual End button reaches the same line with the
+  PHONE clock, so on a phone reading 40 s behind GPS time a 296 s run recorded 256 s, and one reading
+  400 s behind recorded zero. The cap is now taken against the countdown's own fix-time end, and the
+  manual stop passes fix time like every other path. Five of the ten findings were this one bug seen
+  from four angles.
+- **The chart scale came from the data.** Every auto-ended run holds 46 s at or below half speed, so
+  the whole interesting part collapsed towards the target line. Now the scale comes from the target.
+- **Two ends could save one run twice.** The run screen stays up for 2.5 s after the end, so a
+  hold-to-end already in flight when the countdown expired saved a second copy. `stopRun` is now
+  idempotent.
+- **The clear button on the new rows was unstyled**, because the rule was bound to one id. At 375 px
+  the countdown field was crushed to 22 px with a full-width green cross below it.
+- **Three of my own checks did not check anything.** The held-time cap assertion passed with the cap
+  deleted, because 1 Hz fixes make it a no-op; the countdown's phone-clock branch could be removed
+  with nothing failing; and the axis labels vanish entirely for targets slower than 15:00/km, which
+  no check covered. All three now fail when the code is broken.
+
 ## Deviations from SPEC.md, and why
 
 - Fix age gate (spec: reject fixes older than 2 s by the phone clock) replaced by `maximumAge: 0`
@@ -144,6 +169,27 @@ into a long silence.
 - Cadence metronome (added 2026-09-15): opt-in tickbox, default 170 steps per minute, a 30 ms
   vibration where the browser supports it and a short click where it does not (iOS Safari has no
   Vibration API). Self-correcting schedule, so it cannot drift over a 12-minute run.
+- Countdown (added 2026-09-15): blank by default, entered with the same digit-shift entry as the
+  target pace. It starts when the clock starts, at target pace and back-dated with it, and ends the
+  run when it runs out. Two paths end it: `onFix` on fix time, which is what gets recorded, and
+  `tick` on the phone clock, so a GPS dropout in the last seconds cannot overrun the countdown. The
+  recorded end is always `t0 + limit` in fix time, and `held_s` is capped at the end of the run.
+- Voice announcements (added 2026-09-15): blank by default, set in metres. At every multiple the
+  browser's own speech synthesiser says the distance covered and the pace over that segment, as
+  minutes and seconds per kilometre: "500 metres, pace 3 minutes 52 seconds", then "1000 metres, 500
+  metre pace 4 minutes 5 seconds". The crossing almost never lands on a fix, so its time is
+  interpolated between the two fixes that straddle it, the same way the km splits are. The phrase
+  itself is `PaceCore.markPhrase`, pure and tested. iOS will not speak unless the first utterance
+  follows a tap, so Start primes it with a silent one.
+- Run chart (added 2026-09-15): tapping a finished run opens the whole run as an inline SVG line
+  chart. Speed is plotted so faster is higher, but the axis is labelled in pace, which is the number
+  a runner thinks in. The bright line is the smoothed speed the tones used, the faint line is the raw
+  fix-by-fix speed, which is also the quickest way to see whether a phone is giving chipset Doppler
+  speed or falling back to position differencing. A data gap breaks the line rather than drawing a
+  straight line across missing time. Geometry is `PaceCore.chartPaths`, kept pure so the self-check
+  covers it. The vertical scale runs from half to one and a half times target pace and is set by the
+  target, never by the data: almost every run ends stopped or walking, and one slow tail or one
+  accepted GPS spike would otherwise squash the whole run into a few pixels around the target line.
 - Tones use one short-lived oscillator per note rather than one long-running oscillator. Simpler,
   same autoplay behaviour once the AudioContext is resumed in the Start tap.
 - End button needs a 1 s hold, in place of a separate touch-swallowing overlay. The run screen is

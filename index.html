@@ -18,11 +18,17 @@
   button.danger { background: #c33; color: #fff; }
   .targetRow { display: flex; gap: 8px; align-items: stretch; }
   .targetRow input { flex: 1; }
-  #targetClear { width: 60px; margin: 0; flex: none; background: #333; color: #eee; font-weight: 400; font-size: 1.6rem; padding: 0; }
+  #targetClear, #limitClear, #voiceClear { width: 60px; margin: 0; flex: none; background: #333; color: #eee; font-weight: 400; font-size: 1.6rem; padding: 0; }
   .row { display: flex; gap: 8px; }
   .row > * { flex: 1; }
   .hint { color: #888; font-size: .85rem; margin-top: 6px; }
   .check { display: flex; align-items: center; gap: 10px; color: #eee; font-size: 1rem; margin: 16px 0 0; }
+  .countdown { font-size: 2.6rem; font-weight: 700; text-align: center; color: #eee; font-variant-numeric: tabular-nums; margin-top: 6px; }
+  .countdown.low { color: #f85; }
+  #detail { position: fixed; inset: 0; background: #111; padding: 16px; overflow-y: auto; z-index: 10; }
+  #detail svg { width: 100%; height: auto; background: #1c1c1c; border-radius: 8px; }
+  #detail .legend { color: #888; font-size: .8rem; margin-top: 8px; }
+  li.tappable { cursor: pointer; }
   .check input { width: 22px; height: 22px; flex: none; padding: 0; accent-color: #2b7; }
   #run { position: fixed; inset: 0; background: #111; padding: 16px; display: flex; flex-direction: column; user-select: none; touch-action: none; }
   #run.fall { background: #401; } #run.rise { background: #032; } #run.drop { background: #330; }
@@ -56,6 +62,20 @@
   </div>
   <div class="hint">Falling tone when slower than target minus tolerance. Rising tone only when faster than target plus threshold. Silent in between. The tolerances move the tones only: the clock still starts at target pace and time on pace still counts only at or above it.</div>
 
+  <label>Countdown (min:sec, blank for none)</label>
+  <div class="targetRow">
+    <input id="limit" inputmode="numeric" autocomplete="off" placeholder="none" value="">
+    <button id="limitClear" type="button" title="Clear" aria-label="Clear countdown">&times;</button>
+  </div>
+  <div class="hint">Same digit entry: 1, 2, 0, 0 gives 12:00. Left blank there is no countdown. The countdown starts when the clock does, at target pace, and ends the run when it runs out.</div>
+
+  <label>Voice every (metres, blank for none)</label>
+  <div class="targetRow">
+    <input id="voice" inputmode="numeric" autocomplete="off" placeholder="none" value="">
+    <button id="voiceClear" type="button" title="Clear" aria-label="Clear voice increment">&times;</button>
+  </div>
+  <div class="hint" id="voiceHint"></div>
+
   <label class="check"><input type="checkbox" id="cadOn"> Cadence metronome</label>
   <div class="row"><div><label>Steps per minute</label><input id="cadSpm" inputmode="numeric" value="170"></div></div>
   <div class="hint" id="cadHint"></div>
@@ -70,6 +90,7 @@
   <div class="state" id="state">Waiting for GPS</div>
   <div class="pace" id="pace">--:--</div>
   <div class="dev" id="devTxt">&nbsp;</div>
+  <div class="countdown" id="countdown" hidden></div>
   <div class="stats">
     <div><b id="held">0:00</b><span>held at pace</span></div>
     <div><b id="dist">0</b><span>m</span></div>
@@ -77,6 +98,14 @@
     <div><b id="acc">--</b><span>GPS accuracy m</span></div>
   </div>
   <button id="stop" class="danger">Hold to end</button>
+</div>
+
+<div id="detail" hidden>
+  <h1 id="detailTitle">Run</h1>
+  <div id="detailStats"></div>
+  <div id="detailChart"></div>
+  <div class="legend">Bright line: the smoothed pace the tones used. Faint line: the raw fix-by-fix speed. Dashed: target. The vertical mark is where the clock started.</div>
+  <button id="detailClose" class="secondary">Close</button>
 </div>
 
 <!-- Pure algorithm. No DOM. test/selfcheck.js extracts and runs this block under Node. -->
@@ -97,6 +126,8 @@ const PaceCore = (() => {
                       // from about 14/min to 5/min without slowing a real call. In seconds, not fixes,
                       // so a phone delivering a fix every 4 s does not turn this into a 12 s delay.
                       // Measured on synthetic noise and on the real fixture: test/compare-smoothing.js
+    limitS: null,     // countdown in seconds from the clock starting; null = no countdown
+    voiceM: null,     // speak at every multiple of this many metres; null = silent
     stillWindow: 5, stillRadius: 4,   // standing still: every fix in the last 5 s within 4 m of the newest (tune)
     minSemi: 2        // ponytail: glide floor so a 1% miss still sounds directional; 0 = pure spec mapping
   };
@@ -139,6 +170,65 @@ const PaceCore = (() => {
     return { digits: d, sec, text: Math.floor(sec / 60) + ':' + String(sec % 60).padStart(2, '0') };
   }
 
+  // Chart geometry for a finished run: SVG path strings plus axis ticks, in a w by h box with the
+  // given margins. Pure, so the shape of the picture is covered by the self-check rather than by
+  // looking at it. Speed is plotted (up = faster) but the axis is labelled in pace, which is the
+  // number a runner thinks in. A data gap breaks the line instead of drawing a straight lie across it.
+  function chartPaths(run, w, h, m) {
+    m = Object.assign({ l: 46, r: 8, t: 10, b: 20 }, m);
+    const pts = (run.log || []).filter(e => e.ok && e.v != null);
+    if (pts.length < 2) return null;
+    const vt = 1000 / run.target_s_per_km;
+    const t0 = pts[0].t, tEnd = pts[pts.length - 1].t;
+    const span = Math.max(1, tEnd - t0);
+    // Range from the target, not from the data. Nearly every run ends with a stop or a walk, and one
+    // slow tail or one accepted GPS spike would otherwise squash the whole run into a few pixels
+    // around the target line. Half to one and a half times target covers everything worth seeing, and
+    // the bottom edge is exactly the auto-end threshold. Values outside are clamped by Y.
+    const vMax = vt * 1.5, vMin = vt * 0.5;
+    const X = t => m.l + (t - t0) / span * (w - m.l - m.r);
+    const Y = v => m.t + (vMax - Math.min(Math.max(v, vMin), vMax)) / (vMax - vMin || 1) * (h - m.t - m.b);
+    const pathOf = key => {
+      let d = '', pen = false;
+      for (const e of pts) {
+        const v = e[key];
+        if (v == null || v <= 0) { pen = false; continue; }
+        d += (pen && !e.gap ? 'L' : 'M') + X(e.t).toFixed(1) + ' ' + Y(v).toFixed(1) + ' ';
+        pen = true;
+      }
+      return d.trim();
+    };
+    // y ticks at whole speeds is meaningless to a runner, so tick at round paces inside the range
+    const yTicks = [];
+    for (let sec = 120; sec <= 1800; sec += sec < 600 ? 30 : 60) {
+      const v = 1000 / sec;
+      if (v > vMin && v < vMax) yTicks.push({ y: Y(v), label: Math.floor(sec / 60) + ':' + String(sec % 60).padStart(2, '0') });
+      if (yTicks.length >= 6) break;
+    }
+    const step = span > 900 ? 300 : span > 300 ? 120 : 60;
+    const xTicks = [];
+    for (let t = 0; t <= span; t += step) xTicks.push({ x: X(t0 + t), label: Math.round(t / 60) + 'm' });
+    return {
+      w, h, m, smooth: pathOf('v'), raw: pathOf('speed'),
+      targetY: Y(vt), startX: run.t0 != null && run.t0 >= t0 && run.t0 <= tEnd ? X(run.t0) : null,
+      xTicks, yTicks, span
+    };
+  }
+
+  // What the voice says at a distance marker: the total covered, then the pace over the segment just
+  // run, as minutes and seconds PER KILOMETRE, which is the number a runner thinks in. 500 m covered
+  // in 1:56 is a 3:52 pace, and that is what gets said. Spoken, not printed: no leading zero on the
+  // seconds ("4 minutes 5 seconds"), singular where it should be, and no "0 minutes".
+  function markPhrase(mark) {
+    const sec = Math.round(mark.seg_s / (mark.seg_m / 1000));
+    const mm = Math.floor(sec / 60), ss = sec % 60;
+    const mins = mm ? `${mm} minute${mm === 1 ? '' : 's'}` : '';
+    const secs = ss || !mm ? `${ss} second${ss === 1 ? '' : 's'}` : '';
+    const pace = [mins, secs].filter(Boolean).join(' ');
+    const lead = `${mark.total_m} metres`;
+    return mark.first ? `${lead}, pace ${pace}` : `${lead}, ${mark.seg_m} metre pace ${pace}`;
+  }
+
   function create(opts) {
     const c = Object.assign({}, DEF, opts);
     const VT = 1000 / c.targetSec;
@@ -147,14 +237,20 @@ const PaceCore = (() => {
       state: 'ARMED', v: null, dev: null, lastT: null, lastAccT: null, lastRaw: null,
       t0: null, tSlow0: null, slowS: 0, dist: 0, onPace: 0, fastRun: 0,
       good: 0, atpace: 0, atpaceT: null, rampT0: null, dropped: false, still: false, recent: [],
-      toneKind: null, toneWant: null, toneRun: 0, toneWantT0: null,
+      toneKind: null, toneWant: null, toneRun: 0, toneWantT0: null, t0Wall: null,
+      nextMark: null, lastMarkT: null, prevDist: 0, prevT: null, marks: [],
       log: [], track: [], result: null
     };
 
     function finish(tEnd, reason) {
       if (s.state === 'END') return;
       const t0 = s.t0 ?? tEnd;
-      const heldEnd = s.tSlow0 ?? s.lastT ?? tEnd;
+      // The countdown has to cap the held time, because with fixes several seconds apart the fix that
+      // trips it lands past the end. Cap against the countdown's own fix-time end, never against the
+      // tEnd the caller passed: a manual stop passes the phone clock, and a phone clock that reads
+      // behind GPS time would silently shorten, or zero, the headline number.
+      const cap = c.limitS && s.t0 != null ? s.t0 + c.limitS : Infinity;
+      const heldEnd = Math.min(s.tSlow0 ?? s.lastT ?? tEnd, cap);
       // km splits from the per-fix (t, dist) log
       const splits = []; let nextKm = 1000, prev = null, lastKmT = t0;
       for (const e of s.log) {
@@ -169,7 +265,7 @@ const PaceCore = (() => {
       s.result = {
         version: 1, reason, target_s_per_km: c.targetSec, under_tol: c.underTol, over_thr: c.overThr,
         t0, t_end: tEnd, held_s: Math.max(0, heldEnd - t0), on_pace_s: s.onPace, dist_m: s.dist,
-        splits, track: s.track, log: s.log
+        limit_s: c.limitS, voice_m: c.voiceM, marks: s.marks, splits, track: s.track, log: s.log
       };
       s.state = 'END';
       return s.result;
@@ -226,7 +322,12 @@ const PaceCore = (() => {
       } else if (s.state === 'RAMP') {
         if (s.v >= VT) {                     // auto-start at the target itself, never at the tolerance
           s.atpace++; if (s.atpaceT == null) s.atpaceT = f.t;
-          if (s.atpace >= 3) { s.t0 = s.atpaceT; s.state = 'RUNNING'; ev.push('go'); }
+          if (s.atpace >= 3) {
+            s.t0 = s.atpaceT; s.state = 'RUNNING'; ev.push('go');
+            s.t0Wall = now - (f.t - s.t0);   // the same instant on the phone clock, so the countdown
+            s.lastMarkT = s.t0; s.prevT = s.t0; s.prevDist = 0;
+            if (c.voiceM) s.nextMark = c.voiceM;
+          }                                  // still ends the run when fixes stop arriving
         } else { s.atpace = 0; s.atpaceT = null; }
         if (s.state === 'RAMP' && f.t - s.rampT0 >= c.rampTimeout) { ev.push('warn'); s.rampT0 = f.t; }
       } else if (s.state === 'RUNNING') {
@@ -239,6 +340,22 @@ const PaceCore = (() => {
         } else if (s.v >= c.resumeF * VT) {
           if (++s.fastRun >= 3) { s.slowS = 0; s.tSlow0 = null; }
         }
+        // Distance markers for the voice. The crossing almost never lands on a fix, so the time is
+        // interpolated between the two fixes that straddle it, the same way the km splits are. A fix
+        // that jumps several markers at once announces only the last: nobody wants four in a row.
+        if (s.nextMark != null && s.dist >= s.nextMark && s.dist > s.prevDist) {
+          let mark = null;
+          while (s.dist >= s.nextMark) {
+            const tMark = s.prevT + (s.nextMark - s.prevDist) / (s.dist - s.prevDist) * (f.t - s.prevT);
+            mark = { kind: 'mark', total_m: s.nextMark, seg_m: c.voiceM, seg_s: tMark - s.lastMarkT,
+                     t: tMark, first: s.marks.length === 0 };
+            s.lastMarkT = tMark; s.nextMark += c.voiceM;
+            s.marks.push(mark);
+          }
+          ev.push(mark);
+        }
+        s.prevDist = s.dist; s.prevT = f.t;
+        if (c.limitS && s.state === 'RUNNING' && f.t - s.t0 >= c.limitS) { finish(s.t0 + c.limitS, 'timer'); ev.push('end'); }
       }
       s.log.push({ t: f.t, ok: true, speed: f.speed, acc: f.acc, v: s.v, dist: s.dist, gap, still: s.still });
       if (f.lat != null) s.track.push({ t: f.t, lat: f.lat, lon: f.lon, v: speed });
@@ -247,20 +364,35 @@ const PaceCore = (() => {
 
     // Call on a timer. Returns 'dropout' once when fixes have stopped for > dropout s.
     function tick(now) {
-      if (s.state === 'END' || s.lastAccT == null || s.dropped) return null;
+      if (s.state === 'END') return null;
+      // The countdown is a stopwatch, so it runs on the phone clock and ends the run even if fixes
+      // have stopped. Everything recorded still comes from fix timestamps.
+      if (c.limitS && s.t0Wall != null && now - s.t0Wall >= c.limitS) { finish(s.t0 + c.limitS, 'timer'); return 'limit'; }
+      if (s.lastAccT == null || s.dropped) return null;
       if (now - s.lastAccT > c.dropout) { s.dropped = true; return 'dropout'; }
       return null;
+    }
+
+    // Seconds left on the countdown, or null when there is none. Fix time while fixes arrive, phone
+    // clock in between, so the number counts down smoothly instead of stepping once a second.
+    function remaining(now) {
+      if (!c.limitS) return null;
+      if (s.t0 == null) return c.limitS;     // not started yet, so all of it is still to come
+      const elapsed = s.state === 'END' ? (s.result.t_end - s.t0)
+        : s.t0Wall != null ? Math.max(now - s.t0Wall, (s.lastT ?? s.t0) - s.t0)
+        : (s.lastT ?? s.t0) - s.t0;
+      return Math.max(0, c.limitS - elapsed);
     }
 
     // What to play now: the confirmed kind, at the repeat period the current deviation asks for.
     const toneNow = () => s.toneKind == null ? null
       : { kind: s.toneKind, period: toneFor(s.dev, c)?.period ?? 2 };
 
-    return { s, c, VT, STOP_S, onFix, tick, finish: (t) => finish(t, 'manual'), toneNow,
+    return { s, c, VT, STOP_S, onFix, tick, remaining, finish: (t) => finish(t, 'manual'), toneNow,
              tone: (dev) => toneFor(dev, c), glideHz: (dev) => glideHz(dev, c) };
   }
 
-  return { create, haversine, toneFor, glideHz, paceDigits, DEF };
+  return { create, haversine, toneFor, glideHz, paceDigits, chartPaths, markPhrase, DEF };
 })();
 if (typeof module !== 'undefined') module.exports = PaceCore;
 </script>
@@ -269,7 +401,7 @@ if (typeof module !== 'undefined') module.exports = PaceCore;
 (() => {
   const $ = id => document.getElementById(id);
   const LS = 'pace.runs', LSCFG = 'pace.cfg';
-  let core, ctx, watchId, wakeLock, uiTimer, toneTimer, lastGlide = 0, lastTick = 0, sim = null;
+  let core, ctx, watchId, wakeLock, uiTimer, toneTimer, holdT, lastGlide = 0, lastTick = 0, sim = null;
 
   // ---- settings
   const cfg = JSON.parse(localStorage.getItem(LSCFG) || '{}');
@@ -295,10 +427,28 @@ if (typeof module !== 'undefined') module.exports = PaceCore;
   $('target').addEventListener('input', e => setDigits(e.target.value));
   $('targetClear').addEventListener('click', () => { setDigits(''); $('target').focus(); });
   setDigits(cfg.target || '3:52');
+
+  // Countdown uses the same entry. Blank means no countdown, which is the default.
+  let limSec = null;
+  function setLimit(raw) {
+    const r = PaceCore.paceDigits(raw);
+    limSec = r.sec;
+    const el = $('limit');
+    el.value = r.text;
+    if (document.activeElement === el) el.setSelectionRange(el.value.length, el.value.length);
+  }
+  $('limit').addEventListener('input', e => setLimit(e.target.value));
+  $('limitClear').addEventListener('click', () => { setLimit(''); $('limit').focus(); });
+  setLimit(cfg.limit || '');
+
+  const voiceM = () => { const n = parseInt($('voice').value.replace(/\D/g, ''), 10); return n > 0 ? n : null; };
+  $('voice').addEventListener('input', e => { e.target.value = e.target.value.replace(/\D/g, '').slice(0, 5); });
+  $('voiceClear').addEventListener('click', () => { $('voice').value = ''; $('voice').focus(); });
+  if (cfg.voice) $('voice').value = cfg.voice;
   // A browser restores form fields after this script runs (reload, back button), which would leave
   // the field showing one pace while the run used another. Re-read the field so what is displayed is
   // always what starts. Observed on a desktop reload, 2026-09-15.
-  addEventListener('pageshow', () => setDigits($('target').value || cfg.target || '3:52'));
+  addEventListener('pageshow', () => { setDigits($('target').value || cfg.target || '3:52'); setLimit($('limit').value); });
   const fmtPace = sPerKm => !isFinite(sPerKm) || sPerKm > 1800 ? '--:--' : `${Math.floor(sPerKm / 60)}:${String(Math.round(sPerKm % 60)).padStart(2, '0')}`;
   const fmtT = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
 
@@ -343,6 +493,22 @@ if (typeof module !== 'undefined') module.exports = PaceCore;
     ? 'A short buzz on every step. Default 170 steps per minute.'
     : 'This phone has no vibration for web pages, so the metronome clicks instead. Default 170 steps per minute.';
 
+  // ---- voice. The browser's own synthesiser, so there is nothing to download and it works offline.
+  // iOS will not speak unless the first utterance follows a user gesture, so Start primes it.
+  const canSpeak = 'speechSynthesis' in window;
+  function say(text) {
+    if (!canSpeak) return;
+    try {
+      const u = new SpeechSynthesisUtterance(text);
+      u.rate = 1.05; u.lang = navigator.language || 'en-GB';
+      speechSynthesis.cancel();     // a marker that lands on the previous one replaces it, never queues
+      speechSynthesis.speak(u);
+    } catch (e) { /* a phone with no voice installed */ }
+  }
+  $('voiceHint').textContent = canSpeak
+    ? 'Speaks the distance and the pace over that segment, for example "500 metres, pace 3 minutes 52 seconds".'
+    : 'This browser has no speech synthesiser, so the voice option will stay silent.';
+
   function toneLoop() {
     const s = core.s, t = now();
     let tone = null;
@@ -357,7 +523,8 @@ if (typeof module !== 'undefined') module.exports = PaceCore;
     const cd = pos.coords;
     const r = core.onFix({ t: pos.timestamp / 1000, lat: cd.latitude, lon: cd.longitude, speed: cd.speed, acc: cd.accuracy }, wall());
     for (const e of r.events) {
-      if (e === 'go') goBeep();
+      if (e && e.kind === 'mark') say(PaceCore.markPhrase(e));
+      else if (e === 'go') goBeep();
       else if (e === 'warn') warnTone();
       else if (e === 'end') { endTone(); stopRun(); }
     }
@@ -376,13 +543,18 @@ if (typeof module !== 'undefined') module.exports = PaceCore;
     if (!targetSec || targetSec < 90 || targetSec > 1800) { alert('Target pace between 1:30 and 30:00 per km. Type digits: 3 5 2 gives 3:52.'); return; }
     const underTol = Math.max(0, +$('under').value || 0) / 100, overThr = Math.max(0, +$('over').value || 0) / 100;
     const spm = Math.max(40, Math.min(260, +$('cadSpm').value || 170));
+    if (limSec != null && limSec < 10) { alert('Countdown must be at least 0:10, or blank for none.'); return; }
+    const vM = voiceM();
+    if (vM != null && vM < 50) { alert('Voice increment must be at least 50 metres, or blank for none.'); return; }
     localStorage.setItem(LSCFG, JSON.stringify({ target: $('target').value, under: $('under').value,
-      over: $('over').value, cad: $('cadOn').checked, spm }));
-    core = PaceCore.create({ targetSec, underTol, overThr });
+      over: $('over').value, cad: $('cadOn').checked, spm, limit: $('limit').value, voice: $('voice').value }));
+    core = PaceCore.create({ targetSec, underTol, overThr, limitS: limSec, voiceM: vM });
+    $('countdown').hidden = limSec == null;
 
     ctx = ctx || new (window.AudioContext || window.webkitAudioContext)();
     if ('audioSession' in navigator) { try { navigator.audioSession.type = 'playback'; } catch (e) {} }  // iOS silent switch
     ctx.resume(); lastGlide = lastTick = 0;
+    if (vM && canSpeak) { try { speechSynthesis.speak(new SpeechSynthesisUtterance(' ')); } catch (e) {} }   // iOS needs the first utterance inside the tap
     lock();
     if ($('cadOn').checked) cadenceStart(spm);
     if (sim) sim.start(onPosition);
@@ -394,8 +566,12 @@ if (typeof module !== 'undefined') module.exports = PaceCore;
   }
 
   function stopRun() {
-    if (core.s.state !== 'END') core.finish(wall());
-    clearInterval(uiTimer); clearInterval(toneTimer); cadenceStop();
+    if (!uiTimer) return;                     // the countdown and the End button can both fire; save once
+    // Fix time, like every other finish: the phone clock never decides a recorded number.
+    if (core.s.state !== 'END') core.finish(core.s.lastT ?? wall());
+    clearInterval(uiTimer); uiTimer = null;
+    clearInterval(toneTimer); clearTimeout(holdT); cadenceStop();
+    if (canSpeak) { try { speechSynthesis.cancel(); } catch (e) {} }
     if (sim) sim.stop(); else navigator.geolocation.clearWatch(watchId);
     wakeLock?.release(); wakeLock = null;
     saveRun(core.s.result);
@@ -405,8 +581,16 @@ if (typeof module !== 'undefined') module.exports = PaceCore;
 
   function render() {
     const s = core.s, t = wall();
-    if (core.tick(t) === 'dropout') dropBeep();
-    const label = { ARMED: 'Waiting for GPS', RAMP: 'Get to pace', RUNNING: 'GO', END: s.result?.reason === 'auto' ? 'Ended' : 'Stopped' }[s.state];
+    const ev = core.tick(t);
+    if (ev === 'dropout') dropBeep();
+    else if (ev === 'limit') { endTone(); stopRun(); }
+    const left = core.remaining(t);
+    if (left != null) {
+      $('countdown').textContent = fmtT(left) + ' left';
+      $('countdown').classList.toggle('low', left <= 30);
+    }
+    const label = { ARMED: 'Waiting for GPS', RAMP: 'Get to pace', RUNNING: 'GO',
+                    END: s.result?.reason === 'timer' ? 'Time' : s.result?.reason === 'auto' ? 'Ended' : 'Stopped' }[s.state];
     $('state').textContent = s.dropped ? 'GPS lost' : label;
     $('pace').textContent = s.v == null ? '--:--' : s.v < 0.5 ? '∞' : fmtPace(1000 / s.v);   // standing still: infinity
     $('devTxt').textContent = s.dev == null ? '' : (s.dev >= 0 ? '+' : '') + (s.dev * 100).toFixed(0) + '%';
@@ -417,7 +601,6 @@ if (typeof module !== 'undefined') module.exports = PaceCore;
   }
 
   // hold 1 s to end, so a bump does not stop the run
-  let holdT;
   $('stop').addEventListener('pointerdown', () => { holdT = setTimeout(() => { endTone(); stopRun(); }, 1000); });
   for (const e of ['pointerup', 'pointerleave', 'pointercancel']) $('stop').addEventListener(e, () => clearTimeout(holdT));
   $('start').addEventListener('click', start);
@@ -435,15 +618,43 @@ if (typeof module !== 'undefined') module.exports = PaceCore;
     const a = document.createElement('a'); a.href = URL.createObjectURL(file); a.download = name; a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 5000);
   }
+  // ---- run detail: the speed of the whole run as a line chart, from the per-fix log
+  function showRun(r) {
+    const c = PaceCore.chartPaths(r, 340, 190);
+    $('detailTitle').textContent = new Date(r.t0 * 1000).toLocaleString();
+    $('detailStats').innerHTML = `<div class="hint">Target ${fmtPace(r.target_s_per_km)}/km, ended: ${r.reason}` +
+      `${r.limit_s ? ', countdown ' + fmtT(r.limit_s) : ''}${r.voice_m ? ', voice every ' + r.voice_m + ' m' : ''}</div>` +
+      `<div class="stats" style="margin:10px 0">
+        <div><b>${fmtT(r.held_s)}</b><span>held at pace</span></div>
+        <div><b>${Math.round(r.dist_m)}</b><span>m</span></div>
+        <div><b>${fmtT(r.on_pace_s)}</b><span>on pace</span></div>
+        <div><b>${r.dist_m > 0 ? fmtPace(r.held_s > 0 ? r.held_s / (r.dist_m / 1000) : 0) : '--:--'}</b><span>average /km</span></div>
+      </div>`;
+    $('detailChart').innerHTML = c ? `
+      <svg viewBox="0 0 ${c.w} ${c.h}" role="img" aria-label="Speed over the run">
+        ${c.yTicks.map(t => `<line x1="${c.m.l}" y1="${t.y.toFixed(1)}" x2="${c.w - c.m.r}" y2="${t.y.toFixed(1)}" stroke="#333"/>
+          <text x="${c.m.l - 6}" y="${(t.y + 3).toFixed(1)}" fill="#888" font-size="9" text-anchor="end">${t.label}</text>`).join('')}
+        ${c.xTicks.map(t => `<text x="${t.x.toFixed(1)}" y="${c.h - 6}" fill="#888" font-size="9" text-anchor="middle">${t.label}</text>`).join('')}
+        <line x1="${c.m.l}" y1="${c.targetY.toFixed(1)}" x2="${c.w - c.m.r}" y2="${c.targetY.toFixed(1)}" stroke="#2b7" stroke-dasharray="4 3"/>
+        ${c.startX != null ? `<line x1="${c.startX.toFixed(1)}" y1="${c.m.t}" x2="${c.startX.toFixed(1)}" y2="${c.h - c.m.b}" stroke="#666" stroke-dasharray="2 3"/>` : ''}
+        <path d="${c.raw}" fill="none" stroke="#557" stroke-width="1"/>
+        <path d="${c.smooth}" fill="none" stroke="#2b7" stroke-width="2" stroke-linejoin="round"/>
+      </svg>` : '<div class="hint">Too few fixes in this run to draw a chart.</div>';
+    $('detail').hidden = false;
+  }
+  $('detailClose').addEventListener('click', () => { $('detail').hidden = true; });
+
   function renderRuns() {
     const runs = loadRuns(); const ul = $('runs'); ul.innerHTML = '';
     runs.forEach((r, i) => {
       const li = document.createElement('li');
+      li.className = 'tappable';
       li.innerHTML = `<small>${new Date(r.t0 * 1000).toLocaleString()} at ${fmtPace(r.target_s_per_km)}/km, ${r.reason}</small>
         <b>${fmtT(r.held_s)}</b> held, ${fmtT(r.on_pace_s)} on pace, ${Math.round(r.dist_m)} m
         ${r.splits.map(x => ` · km ${x.km} ${fmtT(x.s)}`).join('')}
         <div class="row"><button class="secondary">Export</button><button class="secondary">Delete</button></div>`;
       const [ex, del] = li.querySelectorAll('button');
+      li.onclick = e => { if (!e.target.closest('button')) showRun(r); };
       ex.onclick = () => exportRun(r);
       del.onclick = () => { if (confirm('Delete this run?')) { runs.splice(i, 1); localStorage.setItem(LS, JSON.stringify(runs)); renderRuns(); } };
       ul.appendChild(li);

@@ -208,6 +208,167 @@ check('a loose tolerance moves the tones only, never the clock or the recorded t
   assert.strictEqual(PaceCore.toneFor(-0.05, strict.c).kind, 'fall');
 });
 
+check('countdown: ends the run at the limit, held time capped, no countdown when unset', () => {
+  const core = PaceCore.create({ limitS: 60 });
+  const ramp = Array.from({ length: 20 }, (_, i) => [1, 2.0 + (4.4 - 2.0) * i / 19]);
+  const rec = replay(core, [...ramp, [120, 4.4]]);
+  const endIdx = rec.findIndex(r => r.events.includes('end'));
+  assert(endIdx > 0, 'countdown never ended the run');
+  assert.strictEqual(core.s.result.reason, 'timer');
+  assert.strictEqual(core.s.result.t_end - core.s.result.t0, 60, 'ended off the limit');
+  assert.strictEqual(core.s.result.held_s, 60, `held_s ${core.s.result.held_s}, must equal the countdown`);
+  assert.strictEqual(core.s.result.limit_s, 60);
+  // Fixes that do not divide the countdown: the fix that trips it lands PAST the end, which is the
+  // only case where the cap does anything. Without the cap this records 63 s of a 60 s countdown.
+  const sparse = PaceCore.create({ limitS: 60 });
+  let st = 2000;
+  for (let i = 0; i < 40; i++, st += 7) sparse.onFix({ t: st, lat: 60 + i * 3.1e-4, lon: -30, speed: 4.5, acc: 8 }, st);
+  assert.strictEqual(sparse.s.result.reason, 'timer');
+  assert.strictEqual(sparse.s.result.held_s, 60, `held_s ${sparse.s.result.held_s} with fixes 7 s apart`);
+  assert.strictEqual(sparse.s.result.t_end - sparse.s.result.t0, 60);
+  const none = PaceCore.create();
+  replay(none, [...ramp, [120, 4.4]]);
+  assert.strictEqual(none.s.state, 'RUNNING', 'a run with no countdown must not end');
+  assert.strictEqual(none.remaining(1e9), null, 'no countdown means no remaining time');
+  const waiting = PaceCore.create({ limitS: 720 });
+  assert.strictEqual(waiting.remaining(1e9), 720, 'before the clock starts the whole countdown remains');
+});
+
+check('countdown: still ends when GPS stops, and counts down on the phone clock', () => {
+  const core = PaceCore.create({ limitS: 60 });
+  let t = 1000, wall = 5000;                       // phone clock deliberately offset from GPS time
+  const feed = (speed, n) => { for (let i = 0; i < n; i++, t++, wall++) core.onFix({ t, lat: 60 + t * 4e-5, lon: -30, speed, acc: 8 }, wall); };
+  feed(4.4, 25);
+  assert.strictEqual(core.s.state, 'RUNNING');
+  const atStart = core.remaining(wall);
+  assert(atStart > 30 && atStart <= 60, `remaining ${atStart} just after the start`);
+  assert.strictEqual(core.tick(wall + 3), null, 'ended early');   // 3 s: inside the dropout window too
+  const r30 = core.remaining(wall + 30);           // fixes have stopped: the display must keep counting
+  assert(Math.abs(r30 - (atStart - 30)) < 1.5, `countdown froze while fixes were not arriving: ${r30} vs ${atStart - 30}`);
+  assert.strictEqual(core.tick(wall + 600), 'limit', 'GPS stopped and the countdown never fired');
+  assert.strictEqual(core.s.result.reason, 'timer');
+  assert.strictEqual(core.s.result.t_end - core.s.result.t0, 60);
+  assert.strictEqual(core.remaining(wall + 600), 0, 'remaining must read zero once it has ended');
+});
+
+check('chart: paths span the run, break at gaps, and the target line sits inside the box', () => {
+  const core = PaceCore.create();
+  const ramp = Array.from({ length: 20 }, (_, i) => [1, 2.0 + (4.4 - 2.0) * i / 19]);
+  replay(core, [...ramp, [60, 4.4]]);
+  const t = core.s.lastT + 30;                                        // a 30 s hole: no fixes at all
+  for (let i = 0; i < 30; i++) core.onFix({ t: t + i, lat: 61 + i * 4e-5, lon: -30, speed: 3.6, acc: 8 }, t + i);
+  const r = core.finish(core.s.lastT);
+  const c = PaceCore.chartPaths(r, 340, 190);
+  assert(c, 'no chart from a run with 110 fixes');
+  const moves = (c.smooth.match(/M/g) || []).length;
+  assert.strictEqual(moves, 2, `line should break once at the gap, got ${moves} segments`);
+  assert(c.smooth.includes('L'), 'no drawn segments');
+  const xs = [...c.smooth.matchAll(/[ML]([\d.]+) /g)].map(m => +m[1]);
+  const ys = [...c.smooth.matchAll(/[ML][\d.]+ ([\d.]+)/g)].map(m => +m[1]);
+  assert(Math.min(...xs) >= c.m.l - 0.1 && Math.max(...xs) <= 340 - c.m.r + 0.1, 'x outside the plot box');
+  assert(Math.min(...ys) >= c.m.t - 0.1 && Math.max(...ys) <= 190 - c.m.b + 0.1, 'y outside the plot box');
+  assert(c.targetY > c.m.t && c.targetY < 190 - c.m.b, 'target line outside the plot box');
+  assert(c.startX != null && c.startX >= c.m.l, 'no mark for where the clock started');
+  assert(c.yTicks.length > 0 && c.yTicks.every(tk => /^\d+:\d\d$/.test(tk.label)), 'y axis must be labelled in pace');
+  assert(c.xTicks.length > 1);
+  // faster must plot higher: find the fastest and slowest logged points
+  const pts = r.log.filter(e => e.ok && e.v != null);
+  const fast = pts.reduce((a, b) => (b.v > a.v ? b : a)), slow = pts.reduce((a, b) => (b.v < a.v ? b : a));
+  const yOf = e => { const i = pts.indexOf(e); return ys[i] ?? null; };
+  if (yOf(fast) != null && yOf(slow) != null) assert(yOf(fast) < yOf(slow), 'faster must be higher on the chart');
+  // The scale must come from the target, not from the extremes of the data: one accepted GPS spike
+  // or the stop at the end of every run would otherwise squash the whole run around the target line.
+  const mk = extra => {
+    const c2 = PaceCore.create();
+    replay(c2, [...Array.from({ length: 20 }, (_, i) => [1, 2.0 + (4.5 - 2.0) * i / 19]), [60, 4.5]]);
+    if (extra) { const tt = c2.s.lastT + 1; c2.onFix({ t: tt, lat: 61, lon: -30, speed: 7.9, acc: 8 }, tt); }
+    const tail = c2.s.lastT + 1;
+    for (let i = 0; i < 60; i++) c2.onFix({ t: tail + i, lat: 62, lon: -30, speed: 0.2, acc: 8 }, tail + i);
+    return PaceCore.chartPaths(c2.s.result ?? c2.finish(c2.s.lastT), 340, 190);
+  };
+  const plain = mk(false), spiked = mk(true);
+  assert(Math.abs(plain.targetY - spiked.targetY) < 0.2, 'one fast fix moved the whole scale');
+  const yAt = c2 => +[...c2.smooth.matchAll(/[ML][\d.]+ ([\d.]+)/g)].map(m => +m[1])[30];
+  assert(Math.abs(yAt(plain) - yAt(spiked)) < 1, 'an outlier squashed the rest of the run');
+  const box = 190 - plain.m.t - plain.m.b;
+  assert(Math.abs(yAt(plain) - plain.targetY) < box * 0.25, 'the on-pace line should sit near the target line');
+  assert(plain.targetY > box * 0.25 && plain.targetY < box * 0.9, 'the target line should sit inside the plot, not at an edge');
+  // the axis must be labelled for slow targets too, not only fast ones
+  const walker = PaceCore.create({ targetSec: 1200 });
+  let ts = 3000;
+  for (let i = 0; i < 40; i++, ts++) walker.onFix({ t: ts, lat: 60 + i * 7.5e-6, lon: -30, speed: 0.85, acc: 8 }, ts);
+  const cs = PaceCore.chartPaths(walker.finish(ts), 340, 190);
+  assert(cs && cs.yTicks.length > 0, 'a 20:00/km target drew an axis with no labels');
+  assert.strictEqual(PaceCore.chartPaths({ log: [], target_s_per_km: 232 }, 340, 190), null, 'empty run must not draw');
+  assert.strictEqual(PaceCore.chartPaths({ target_s_per_km: 232 }, 340, 190), null, 'a run with no log must not draw');
+});
+
+check('voice: a marker every N metres, segment pace interpolated, phrase reads as speech', () => {
+  const core = PaceCore.create({ voiceM: 100 });
+  const ramp = Array.from({ length: 20 }, (_, i) => [1, 2.0 + (4.5 - 2.0) * i / 19]);
+  const rec = replay(core, [...ramp, [200, 4.5]]);           // 4.5 m/s: 100 m every 22.2 s
+  const marks = rec.flatMap(r => r.events).filter(e => e && e.kind === 'mark');
+  assert(marks.length >= 4, `only ${marks.length} markers in 200 s at target pace`);
+  assert.deepStrictEqual(marks.slice(0, 4).map(m => m.total_m), [100, 200, 300, 400], 'markers must fall on multiples');
+  assert.strictEqual(marks[0].first, true);
+  assert.strictEqual(marks[1].first, false);
+  for (const m of marks.slice(1)) {                           // at a steady target pace each 100 m is 23.2 s
+    assert(Math.abs(m.seg_s - 22.2) < 2.5, `segment ${m.total_m} took ${m.seg_s.toFixed(1)}s, expected about 22.2`);
+    assert(m.t > 0 && m.t <= core.s.lastT, 'marker time outside the run');
+  }
+  assert(Math.abs(marks.reduce((a, m) => a + m.seg_s, 0) - (marks[marks.length - 1].t - core.s.t0)) < 0.01,
+    'segment times must add up to the time from the clock start to the last marker');
+  // The spoken pace is per kilometre, not the segment's elapsed time: 500 m in 1:56 is a 3:52 pace.
+  assert.strictEqual(PaceCore.markPhrase({ total_m: 500, seg_m: 500, seg_s: 116, first: true }),
+    '500 metres, pace 3 minutes 52 seconds');
+  assert.strictEqual(PaceCore.markPhrase({ total_m: 1000, seg_m: 500, seg_s: 122.5, first: false }),
+    '1000 metres, 500 metre pace 4 minutes 5 seconds');       // spoken, so no leading zero on 05
+  assert.strictEqual(PaceCore.markPhrase({ total_m: 1000, seg_m: 500, seg_s: 60.5, first: false }),
+    '1000 metres, 500 metre pace 2 minutes 1 second');        // singular
+  assert.strictEqual(PaceCore.markPhrase({ total_m: 400, seg_m: 400, seg_s: 48, first: true }),
+    '400 metres, pace 2 minutes');                            // no "0 seconds"
+  assert.strictEqual(PaceCore.markPhrase({ total_m: 100, seg_m: 100, seg_s: 22, first: true }),
+    '100 metres, pace 3 minutes 40 seconds');                 // a short increment still speaks per km
+  const silent = PaceCore.create();
+  const rec2 = replay(silent, [...ramp, [200, 4.5]]);
+  assert.strictEqual(rec2.flatMap(r => r.events).filter(e => e && e.kind === 'mark').length, 0,
+    'no voice increment set, so nothing may be announced');
+  assert.strictEqual(silent.finish(silent.s.lastT).marks.length, 0);
+});
+
+check('voice: one fix crossing several markers announces once, and the run carries its markers', () => {
+  // Distance integrates the SMOOTHED speed, so at the 50 m minimum the page enforces, one fix can
+  // never cross two markers. A 5 m increment and a 4 s gap between fixes can, which is what the
+  // guard is for.
+  const core = PaceCore.create({ voiceM: 5 });
+  const ramp = Array.from({ length: 20 }, (_, i) => [1, 2.0 + (4.5 - 2.0) * i / 19]);
+  replay(core, [...ramp, [10, 4.5]]);
+  assert.strictEqual(core.s.state, 'RUNNING');
+  const before = core.s.marks.length;
+  const t = core.s.lastT + 4;                                  // 4 s later: inside the 5 s dropout window
+  const r = core.onFix({ t, lat: 60 + t * 4e-5, lon: -30, speed: 4.5, acc: 8 }, t);
+  const announced = r.events.filter(e => e && e.kind === 'mark');
+  assert(core.s.marks.length - before > 1, 'the test did not actually cross several markers');
+  assert.strictEqual(announced.length, 1, 'one fix must not fire several announcements');
+  assert.strictEqual(announced[0].total_m, core.s.marks[core.s.marks.length - 1].total_m, 'must announce the latest');
+  const res = core.finish(core.s.lastT);
+  assert.strictEqual(res.voice_m, 5);
+  assert(res.marks.length > 1 && res.marks.every(m => m.total_m % 5 === 0), 'markers stored with the run');
+  assert.deepStrictEqual(res.marks.map(m => m.total_m), res.marks.map((_, i) => (i + 1) * 5), 'markers must not skip');
+});
+
+check('a phone clock behind GPS time cannot shorten the recorded held time', () => {
+  const core = PaceCore.create();
+  const ramp = Array.from({ length: 20 }, (_, i) => [1, 2.0 + (4.5 - 2.0) * i / 19]);
+  replay(core, [...ramp, [120, 4.5]]);
+  const truth = core.s.lastT - core.s.t0;
+  const early = core.finish(core.s.lastT - 40);      // as a phone reading 40 s behind GPS time would
+  assert.strictEqual(early.held_s, truth, `held_s ${early.held_s}, fix-time truth ${truth}`);
+  const zero = PaceCore.create();
+  replay(zero, [...ramp, [120, 4.5]]);
+  assert.strictEqual(zero.finish(zero.s.t0 - 400).held_s, zero.s.lastT - zero.s.t0, 'a wildly wrong clock zeroed it');
+});
+
 check('manual finish: held_s counts to last fix, reason manual', () => {
   const core = PaceCore.create();
   replay(core, [[50, 4.4]]);
