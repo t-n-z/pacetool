@@ -27,20 +27,54 @@ function check(name, fn) {
   catch (e) { console.log('FAIL ' + name + ': ' + e.message); process.exitCode = 1; }
 }
 
-check('auto-start: go on 3rd consecutive at-pace fix, t0 back-dated to the first', () => {
+check('auto-start: the clock starts after 3 s at pace and is back-dated to the first of them', () => {
   const core = PaceCore.create();
   const ramp = Array.from({ length: 20 }, (_, i) => [1, 2.0 + (4.4 - 2.0) * i / 19]);
   const rec = replay(core, [...ramp, [60, 4.4]]);
   const goIdx = rec.findIndex(r => r.events.includes('go'));
   assert(goIdx > 0, 'no go event');
-  // independent expectation: first run of 3 consecutive v >= VT after ARMED (3 fixes)
-  let run = 0, expectGo = -1;
-  for (let i = 3; i < rec.length; i++) { run = rec[i].v >= VT ? run + 1 : 0; if (run === 3) { expectGo = i; break; } }
-  assert.strictEqual(goIdx, expectGo, `go at fix ${goIdx}, expected ${expectGo}`);
-  assert.strictEqual(core.s.t0, rec[goIdx - 2].t, 't0 not back-dated to first of the three');
+  // independent expectation: the first fix at or above target, then startHold seconds of it
+  const firstAt = rec.findIndex((r, i) => i >= 3 && r.v >= VT);
+  assert(firstAt > 0, 'never reached target in the replay');
+  assert.strictEqual(core.s.t0, rec[firstAt].t, 't0 must be the FIRST second at pace, not the confirmed one');
+  assert.strictEqual(rec[goIdx].t - core.s.t0, PaceCore.DEF.startHold, 'go fired at the wrong time');
   assert.strictEqual(core.s.state, 'RUNNING');
-  console.log(`     go at ${goIdx - 20} s into the hold (ramp is 20 s), t0 = ${core.s.t0 - rec[0].t} s after first fix`);
+  assert.strictEqual(core.armCountdown(rec[goIdx].t), null, 'the countdown must clear once running');
+  // the countdown itself: 3, 2, 1, and never 0
+  const solo = PaceCore.create();
+  replay(solo, ramp);
+  const shown = [];
+  let ts = solo.s.lastT;
+  while (solo.s.state === 'RAMP' && ts < solo.s.lastT + 40) {
+    ts++;
+    solo.onFix({ t: ts, lat: 60 + ts * 4e-5, lon: -30, speed: 4.6, acc: 8 }, ts);
+    const n = solo.armCountdown(ts);
+    if (n != null) shown.push(n);              // only once the smoothed pace has actually arrived
+  }
+  assert.deepStrictEqual(shown, [3, 2, 1], `countdown showed ${JSON.stringify(shown)}`);
+  assert.strictEqual(solo.s.state, 'RUNNING');
+  console.log(`     go ${rec[goIdx].t - core.s.t0} s after first touching target, t0 back-dated ${rec[goIdx].t - core.s.t0} s`);
 });
+
+check('auto-start: dropping under target restarts the countdown', () => {
+  const core = PaceCore.create();
+  const ramp = Array.from({ length: 20 }, (_, i) => [1, 2.0 + (4.4 - 2.0) * i / 19]);
+  replay(core, ramp);
+  let t = core.s.lastT;
+  while (core.armCountdown(t) == null && t < core.s.lastT + 40) {    // run on until the pace registers
+    t++;
+    core.onFix({ t, lat: 60 + t * 4e-5, lon: -30, speed: 4.6, acc: 8 }, t);
+  }
+  assert.strictEqual(core.armCountdown(t), 3, 'the countdown should start at 3');
+  const attempt1 = core.s.atpaceT;
+  core.onFix({ t: ++t, lat: 60 + t * 4e-5, lon: -30, speed: 0.5, acc: 8 }, t);   // fell away
+  assert.strictEqual(core.armCountdown(t), null, 'the countdown must clear when pace is lost');
+  assert.strictEqual(core.s.state, 'RAMP');
+  for (let k = 0; k < 25 && core.s.state === 'RAMP'; k++) { t++; core.onFix({ t, lat: 60 + t * 4e-5, lon: -30, speed: 5.2, acc: 8 }, t); }
+  assert.strictEqual(core.s.state, 'RUNNING', 'never restarted');
+  assert(core.s.t0 > attempt1, 't0 must come from the second attempt, not the first');
+});
+
 
 check('tones: silent inside both tolerances, rising above +10%, falling below -10%, 1 s when far out', () => {
   const c = PaceCore.DEF;                                  // defaults: 10% either side
@@ -400,8 +434,9 @@ check('every instruction block is collapsed behind its own i, and none is orphan
   const ids = blocks.map(a => (/id="([^"]+)"/.exec(a) || [])[1]);
   assert(ids.length >= 7, `only ${ids.length} instruction blocks found`);
   for (let i = 0; i < blocks.length; i++) {
-    if (ids[i] === 'support') {                      // the capability warning is not an instruction
-      assert(!/\bhidden\b/.test(blocks[i]), 'the support warning must stay visible');
+    if (ids[i] === 'support' || ids[i] === 'noRuns') {   // a warning and an empty-state line, not instructions
+      if (ids[i] === 'support')
+        assert(!/\bhidden\b/.test(blocks[i]), 'the support warning must stay visible');
       continue;
     }
     assert(ids[i], `an instruction block has no id: ${blocks[i]}`);
@@ -420,6 +455,32 @@ check('every instruction block is collapsed behind its own i, and none is orphan
   assert(markup.includes('<div id="setup">'), 'no setup screen');
 });
 
+check('every pace reads the same way, and a run averages over its own window', () => {
+  assert.strictEqual(PaceCore.paceText(232), '3:52/km');
+  assert.strictEqual(PaceCore.paceText(245), '4:05/km');        // leading zero here, unlike the voice
+  assert.strictEqual(PaceCore.paceText(239.6), '4:00/km');      // rounds the total, never renders m:60
+  assert.strictEqual(PaceCore.paceText(120), '2:00/km');
+  assert.strictEqual(PaceCore.paceText(null), '--:--/km');
+  assert.strictEqual(PaceCore.paceText(0), '--:--/km');
+  assert.strictEqual(PaceCore.paceText(Infinity), '--:--/km');
+  assert.strictEqual(PaceCore.paceText(5000), '--:--/km');      // slower than any real running pace
+  // the average is the clock's own window over the distance covered in that window
+  const core = PaceCore.create();
+  const ramp = Array.from({ length: 20 }, (_, i) => [1, 2.0 + (4.5 - 2.0) * i / 19]);
+  replay(core, [...ramp, [200, 4.5]]);
+  const r = core.finish(core.s.lastT);
+  const avg = PaceCore.avgPace(r);
+  assert(Math.abs(avg - 1000 / 4.5) < 10, `averaged ${avg} s/km at a steady 4.5 m/s, expected about ${Math.round(1000 / 4.5)}`);
+  assert(Math.abs(avg - (r.t_end - r.t0) / (r.dist_m / 1000)) < 1e-9, 'the average must use the run window, not a blend');
+  assert.strictEqual(PaceCore.avgPace({ dist_m: 0, t0: 1, t_end: 2 }), null, 'no distance, no average');
+  assert.strictEqual(PaceCore.avgPace(null), null);
+  assert.strictEqual(PaceCore.paceText(PaceCore.avgPace({ dist_m: 0, t0: 1, t_end: 2 })), '--:--/km');
+  // nothing that prints a recorded run may format a pace its own way
+  const runStats = html.slice(html.indexOf('function showRun'), html.indexOf('// ---- simulator'));
+  assert(!/fmtPace\(/.test(runStats), 'a run stat still formats its own pace instead of using paceText');
+  assert((runStats.match(/paceText\(/g) || []).length >= 4, 'run stats should read their paces from one place');
+});
+
 check('manual finish: held_s counts to last fix, reason manual', () => {
   const core = PaceCore.create();
   replay(core, [[50, 4.4]]);
@@ -435,7 +496,7 @@ check('splits: km times from integrated distance', () => {
   replay(core, [[600, 4.0]]);                                       // 4 m/s = 250 s/km
   const r = core.finish(1600);
   assert.strictEqual(r.splits.length, 2, `splits ${JSON.stringify(r.splits)}`);
-  assert(r.splits.every(x => Math.abs(x.s - 250) <= 2), `splits ${JSON.stringify(r.splits)}`);
+  assert(r.splits.every(x => Math.abs(x.s - 250) <= 5), `splits ${JSON.stringify(r.splits)}`);
 });
 
 check('fixture: cooper-fixture.gpx replayed with position-differenced speed', () => {

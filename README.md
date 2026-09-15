@@ -38,13 +38,14 @@ over cached fixes.
 
 ## Testing without running
 
-- `node test/selfcheck.js`: 23 checks, exits 1 on failure. Covers auto-start with back-dating, the
+- `node test/selfcheck.js`: 25 checks, exits 1 on failure. Covers auto-start with back-dating, the
   asymmetric tone thresholds and glide mapping, the 46 s stop rule with a 15 s stop that must not
   end the run, ramp timeout, the accuracy and ordering gate, dropout freeze, manual finish, km
   splits, clock-offset independence, stillness detection, the tone hold, target-pace entry,
   tolerance independence of the clock, the countdown (including ending when GPS has stopped), the
   chart geometry and scale, the voice markers and their spoken phrasing, the clear-button styling,
-  the collapsed instructions, and the GPX fixture at two targets. Several were written by mutation: break the code, watch the check fail, put it back.
+  the collapsed instructions, the arming countdown, pace formatting, and the GPX fixture at two
+  targets. Several were written by mutation: break the code, watch the check fail, put it back.
 - Simulator in the browser: open `index.html#sim` (1x) or `index.html#sim=10` (10x). Fake GPS with a
   fixed profile: 20 s ramp, 60 s at 4.5 m/s, 20 s at 4.0, 15 s at 5.0, then 2.0 m/s until the
   auto-end. At 10x the run takes about 20 s and exercises every state and tone. The simulator runs
@@ -164,6 +165,19 @@ three independent skeptics told to refute it. 26 findings, 10 survived. What the
 - Target pace entry is digits-only (added 2026-09-15). A phone's numeric keypad has no colon, so
   digits shift in from the right like a stopwatch: 3, 5, 2 gives 3:52, a fourth digit pushes the rest
   left, seconds past 59 carry into minutes, and the cross clears. `PaceCore.paceDigits`.
+- Pace and Runs are tabs (2026-09-16), not two stacked sections, and a finished run lands on the
+  Runs tab so the result and its chart are one tap away.
+- The clock arms with a visible 3, 2, 1 (2026-09-16). The rule was three consecutive at-pace fixes;
+  it is now three SECONDS at or above target, counted down on screen under the deviation percentage,
+  one number per second. Seconds rather than fixes for the same reason as the tone hold: a phone
+  reporting every four seconds would otherwise take twelve. Drop under target and it clears and
+  restarts. The clock is still back-dated to the first second at pace, so the confirmation costs the
+  runner nothing: it only proves the pace was real. `startHold` in `PaceCore.DEF`.
+- Every pace is printed by `PaceCore.paceText` (2026-09-16), so the target, the run rows, the detail
+  tiles and the splits all read `m:ss/km` and cannot drift apart. A run's average is
+  `PaceCore.avgPace`: the time the clock ran over the distance covered while it ran, one window, not
+  a blend of two. It used to divide the held time by the whole run's distance, which mixed windows.
+  A self-check asserts nothing in the run stats formats a pace its own way.
 - Instructions are collapsed behind small round i buttons (2026-09-16), one per setting, all closed
   on load. The setup screen went from about 1,570 px of content to 745 px on a 375 px phone, so Start
   is now above the fold. `data-for` names the block each i opens, rather than relying on where it
