@@ -166,9 +166,19 @@ check('tone hold: one stray fix never changes the tone, three consecutive do', (
   const rec = replay(core, [[10, 3.4]], { t0: core.s.lastT + 1 });         // a real fade, 3 fixes in
   assert.strictEqual(rec[2].v < VT, true);
   assert.strictEqual(core.toneNow().kind, 'fall', 'sustained slow did not latch the falling tone');
-  const fast = PaceCore.create({ toneHold: 1 });                           // hold 1 = old behaviour
+  const fast = PaceCore.create({ toneHold: 0 });                           // 0 = react to every fix
   replay(fast, [[20, 4.4], [20, 5.6]]);
   assert.strictEqual(fast.toneNow().kind, 'rise');
+
+  // The hold is a time, not a count: a phone giving one fix every 4 s must not turn 3 s into 12 s.
+  const slow = PaceCore.create();
+  let ts = 5000;
+  for (let i = 0; i < 12; i++, ts += 4) slow.onFix({ t: ts, lat: 60 + i * 1.7e-4, lon: -30, speed: 4.4, acc: 8 }, ts);
+  assert.strictEqual(slow.s.state, 'RUNNING');
+  const before = slow.s.lastT;
+  for (let i = 0; i < 2; i++, ts += 4) slow.onFix({ t: ts, lat: 61 + i * 1.3e-4, lon: -30, speed: 3.4, acc: 8 }, ts);
+  assert.strictEqual(slow.toneNow().kind, 'fall', 'two fixes over 4 s apart should already satisfy a 3 s hold');
+  assert(slow.s.lastT - before <= 8, 'latched later than two fixes');
 });
 
 check('target entry: digits shift in from the right, seconds past 59 carry into minutes', () => {

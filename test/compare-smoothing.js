@@ -139,6 +139,112 @@ const row = (label, m) => console.log('  ' + label.padEnd(22) + m.rms.toFixed(2)
   m.chirp.toFixed(1).padStart(13) + m.build.toFixed(0).padStart(10) +
   m.fade.toFixed(0).padStart(9) + m.surge.toFixed(0).padStart(9));
 
+// ---- real-data mode.
+// A synthetic run proves a filter against a noise model I chose; this proves it against GPS as it
+// actually behaved on a real 12-minute run. The fixture carries position only (no chipset speed), so
+// it exercises the position-differencing path, and its fixes are 2 to 6 s apart rather than 1 Hz.
+// There is no true speed to compare against, so the reference is a zero-phase filter: the same EMA
+// run forwards and then backwards over the whole file, which removes noise without the lag a causal
+// filter must have. Causal variants are scored against that.
+function loadFixes(gpxPath) {
+  const xml = fs.readFileSync(gpxPath, 'utf8');
+  const out = [];
+  const re = /<trkpt lat="([-\d.]+)" lon="([-\d.]+)">[\s\S]*?<time>([^<]+)<\/time>/g;
+  let m;
+  while ((m = re.exec(xml))) out.push({ lat: +m[1], lon: +m[2], t: Date.parse(m[3]) / 1000 });
+  return out;
+}
+
+function realSpeeds(fixes) {
+  const sp = [];
+  for (let i = 0; i < fixes.length; i++) {
+    if (i === 0) { sp.push(null); continue; }
+    const dt = fixes[i].t - fixes[i - 1].t;
+    sp.push(dt > 0 ? PaceCore.haversine(fixes[i - 1], fixes[i]) / dt : sp[i - 1]);
+  }
+  sp[0] = sp[1];
+  return sp;
+}
+
+// dt-aware EMA, identical in form to the one in PaceCore
+function emaOver(sp, dts, tau) {
+  let v = null;
+  return sp.map((x, i) => {
+    const a = 1 - Math.exp(-Math.min(dts[i], 10) / tau);
+    return (v = v == null ? x : v + a * (x - v));
+  });
+}
+function zeroPhase(sp, dts, tau) {
+  const f = emaOver(sp, dts, tau);
+  const b = emaOver(f.slice().reverse(), dts.slice().reverse(), tau).reverse();
+  return b;
+}
+// "decide the pace every X metres" over the real track
+function segmentOver(fixes, metres) {
+  const out = []; let startI = 0, v = null, acc = 0;
+  for (let i = 0; i < fixes.length; i++) {
+    if (i > 0) acc += PaceCore.haversine(fixes[i - 1], fixes[i]);
+    if (acc >= metres) { v = acc / (fixes[i].t - fixes[startI].t); startI = i; acc = 0; }
+    out.push(v);
+  }
+  const first = out.find(x => x != null) ?? 0;
+  return out.map(x => (x == null ? first : x));
+}
+
+function realReport(gpxPath, targetSec) {
+  const fixes = loadFixes(gpxPath);
+  const sp = realSpeeds(fixes);
+  const dts = fixes.map((f, i) => (i === 0 ? 1 : f.t - fixes[i - 1].t));
+  const total = fixes[fixes.length - 1].t - fixes[0].t;
+  const vt = 1000 / targetSec;
+  const ref = zeroPhase(sp, dts, 3);
+  const near = ref.map(v => Math.abs(v - vt) / vt <= 0.05);          // the fixes where chirping matters
+
+  const variants = [
+    ['EMA tau 1.5 s', emaOver(sp, dts, 1.5)], ['EMA tau 2 s', emaOver(sp, dts, 2)],
+    ['EMA tau 3 s (shipped)', emaOver(sp, dts, 3)], ['EMA tau 5 s', emaOver(sp, dts, 5)],
+    ['segment 25 m', segmentOver(fixes, 25)], ['segment 50 m', segmentOver(fixes, 50)]
+  ];
+
+  console.log('');
+  console.log('REAL RUN: ' + path.basename(gpxPath) + ', ' + fixes.length + ' fixes over ' + Math.round(total) +
+    ' s, position only, ' + (total / (fixes.length - 1)).toFixed(1) + ' s between fixes');
+  console.log('Target ' + Math.floor(targetSec / 60) + ':' + String(targetSec % 60).padStart(2, '0') +
+    '/km. Reference is a zero-phase 3 s filter over the whole file. "near target" = the ' +
+    near.filter(Boolean).length + ' fixes within 5% of it.');
+  console.log('');
+  console.log('  variant                 RMS m/s   tone changes/min: hold 0   hold 3 s   near target, hold 0   hold 3 s');
+  for (const [name, est] of variants) {
+    let sq = 0;
+    for (let i = 0; i < est.length; i++) sq += (est[i] - ref[i]) ** 2;
+    const rms = Math.sqrt(sq / est.length);
+    const count = (hold, onlyNear) => {
+      let cur = 'none', want = 'none', run = 0, wantT0 = 0, flips = 0, secs = 0;
+      for (let i = 0; i < est.length; i++) {
+        const t = PaceCore.toneFor((est[i] - vt) / vt, Object.assign({}, PaceCore.DEF, { targetSec }));
+        const kind = t ? t.kind : 'none';
+        if (kind === want) run++; else { want = kind; run = 1; wantT0 = fixes[i].t; }
+        const prev = cur;
+        if (hold <= 0 || (run >= 2 && fixes[i].t - wantT0 >= hold)) cur = want;
+        if (onlyNear && !near[i]) continue;
+        secs += dts[i];
+        if (cur !== prev) flips++;
+      }
+      return secs > 0 ? flips / (secs / 60) : 0;
+    };
+    console.log('  ' + name.padEnd(22) + rms.toFixed(2).padStart(8) +
+      count(0, false).toFixed(1).padStart(27) + count(3, false).toFixed(1).padStart(11) +
+      count(0, true).toFixed(1).padStart(22) + count(3, true).toFixed(1).padStart(11));
+  }
+}
+
+const gpxArg = process.argv.indexOf('--gpx');
+if (gpxArg > -1) {
+  const file = process.argv[gpxArg + 1] || path.join(__dirname, 'cooper-fixture.gpx');
+  for (const target of [232, 263]) realReport(file, target);   // 3:52 (the test target) and 4:23 (this run's own pace)
+  process.exit(0);
+}
+
 const runFile = process.argv[2];
 if (runFile) {
   // A real exported run: no truth to compare against, so report what the raw fixes themselves say.
@@ -169,8 +275,8 @@ for (const [model, sigma, title] of [['doppler', 0.3, 'CHIPSET DOPPLER SPEED, si
 
   console.log('');
   console.log('  EMA tau 2 s, sweeping the two quieting knobs');
-  console.log('  hold x underTol' + COLS);
+  console.log('  hold s x underTol' + COLS);
   for (const hold of [1, 2, 3])
     for (const underTol of [0, 0.02])
-      row(`${hold} fix, ${(underTol * 100).toFixed(0)}% tol`, mean(model, sigma, ema(2), hold, underTol));
+      row(`${hold} s, ${(underTol * 100).toFixed(0)}% tol`, mean(model, sigma, ema(2), hold, underTol));
 }

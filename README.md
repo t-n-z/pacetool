@@ -8,7 +8,7 @@ live here.
 |------|-------|
 | `index.html` | The whole product: one page, no dependencies, no backend. Serve over HTTPS. |
 | `test/selfcheck.js` | Node self-check of the algorithm block inside `index.html`. Run `node test/selfcheck.js`. |
-| `test/compare-smoothing.js` | Measures pace-estimation variants against a synthetic run with GPS noise. Also reads a real exported run: `node test/compare-smoothing.js run.json`. |
+| `test/compare-smoothing.js` | Measures pace-estimation variants. No argument: synthetic runs with two GPS noise models. `--gpx`: the real fixture. `run.json`: a run exported from the phone. |
 | `test/cooper-fixture.gpx` | Copy of `PaceTool/fixtures/cooper-fixture.gpx`, replayed by the self-check. |
 | `.claude/launch.json` | Local preview server (`python -m http.server 8765`) for the in-app browser. Not in the repo. |
 
@@ -86,6 +86,33 @@ What it says:
 
 So: 1 Hz sampling and the 3 s filter stay; the tone is what got fixed.
 
+### Checked against a real run, not only against my noise model
+
+`node test/compare-smoothing.js --gpx` scores the same variants over `test/cooper-fixture.gpx`, a
+real 12-minute maximal run. It carries position only, so it exercises the position-differencing path,
+and its fixes are 3.7 s apart rather than 1 Hz. There is no true speed to compare against, so the
+reference is the same filter run forwards and then backwards over the whole file, which removes noise
+without the lag any causal filter must have.
+
+| Variant | Error m/s | Tone changes per min, no hold | With a 3 s hold |
+|---|---|---|---|
+| EMA 3 s, as shipped | 0.18 | 8.3 | 2.1 |
+| EMA 5 s | 0.12 | 6.7 | 1.3 |
+| Decide every 25 m | 0.36 | 5.4 | 4.6 |
+| Decide every 50 m | 0.31 | 0.8 | 0.8 |
+
+Counted over the 50 fixes where the runner was genuinely within 5 % of the 3:52 target, which is
+where chirping matters. Real GPS agrees with the synthetic result and sharpens it: deciding the pace
+every 25 m is twice as noisy as the shipped filter on real data and the hold barely helps it, because
+its updates are already too far apart to be confirmed. The 50 m variant is calm only because it
+speaks every 13 s.
+
+**The real run also caught a flaw in the fix.** The hold was first written as a count of fixes, which
+on this run's 3.7 s spacing turned a 3 s confirmation into an 11 s delay, and made the improvement
+look like 20x rather than 4x. It is now a time: a tone state must persist for 3 s and at least two
+fixes. At 1 Hz that is what it always was, and a phone delivering fixes slowly no longer turns it
+into a long silence.
+
 ## Deviations from SPEC.md, and why
 
 - Fix age gate (spec: reject fixes older than 2 s by the phone clock) replaced by `maximumAge: 0`
@@ -100,8 +127,9 @@ So: 1 Hz sampling and the 3 s filter stay; the tone is what got fixed.
   the smoothed speed is under 0.5 m/s. Without it, GPS drift while standing reads as 15:00 to
   40:00/km and jumps about. `stillWindow`, `stillRadius` in `PaceCore.DEF` (tune). The raw speed
   stays in the log.
-- Tone hold (added 2026-09-15, measured as above): a tone state must persist for 3 fixes before it is
-  played. `toneHold` in `PaceCore.DEF`; 1 restores the spec's react-to-every-fix behaviour.
+- Tone hold (added 2026-09-15, measured as above): a tone state must persist for 3 s and at least two
+  fixes before it is played. `toneHold` in `PaceCore.DEF`, in seconds; 0 restores the spec's
+  react-to-every-fix behaviour.
 - Tolerances move the tones only (changed 2026-09-15). The spec tied auto-start and `on_pace_s` to
   `underTol`; with the tolerance now defaulting to 10 %, that would have started the clock at 4:18/km
   and counted time there as time at pace. Auto-start and `on_pace_s` use the target itself, so a

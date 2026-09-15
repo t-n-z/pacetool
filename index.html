@@ -92,9 +92,11 @@ const PaceCore = (() => {
     accMax: 20, vMax: 8,
     rampTimeout: 60,  // s in RAMP before a warning tone
     dropout: 5,       // s without an accepted fix = data gap, counters frozen
-    toneHold: 3,      // fixes a new tone state must persist before it is played. 1 = react to every fix.
-                      // 3 cuts tone changes at a steady target pace from about 14/min to 5/min without
-                      // slowing a real call. Measured: test/compare-smoothing.js
+    toneHold: 3,      // SECONDS a new tone state must persist before it is played (and at least two
+                      // fixes). 0 = react to every fix. 3 s cuts tone changes at a steady target pace
+                      // from about 14/min to 5/min without slowing a real call. In seconds, not fixes,
+                      // so a phone delivering a fix every 4 s does not turn this into a 12 s delay.
+                      // Measured on synthetic noise and on the real fixture: test/compare-smoothing.js
     stillWindow: 5, stillRadius: 4,   // standing still: every fix in the last 5 s within 4 m of the newest (tune)
     minSemi: 2        // ponytail: glide floor so a 1% miss still sounds directional; 0 = pure spec mapping
   };
@@ -145,7 +147,7 @@ const PaceCore = (() => {
       state: 'ARMED', v: null, dev: null, lastT: null, lastAccT: null, lastRaw: null,
       t0: null, tSlow0: null, slowS: 0, dist: 0, onPace: 0, fastRun: 0,
       good: 0, atpace: 0, atpaceT: null, rampT0: null, dropped: false, still: false, recent: [],
-      toneKind: null, toneWant: null, toneRun: 0,
+      toneKind: null, toneWant: null, toneRun: 0, toneWantT0: null,
       log: [], track: [], result: null
     };
 
@@ -216,8 +218,8 @@ const PaceCore = (() => {
       // persist for toneHold fixes before it is heard. Latching, not averaging: a real change still
       // lands within toneHold seconds, a one-fix wobble is never played.
       const want = toneFor(s.dev, c), kind = want ? want.kind : null;
-      if (kind === s.toneWant) s.toneRun++; else { s.toneWant = kind; s.toneRun = 1; }
-      if (s.toneRun >= c.toneHold) s.toneKind = kind;
+      if (kind === s.toneWant) s.toneRun++; else { s.toneWant = kind; s.toneRun = 1; s.toneWantT0 = f.t; }
+      if (c.toneHold <= 0 || (s.toneRun >= 2 && f.t - s.toneWantT0 >= c.toneHold)) s.toneKind = kind;
 
       if (s.state === 'ARMED') {
         if (++s.good >= 3) { s.state = 'RAMP'; s.rampT0 = f.t; }
