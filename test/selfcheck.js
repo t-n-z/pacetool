@@ -369,6 +369,27 @@ check('a phone clock behind GPS time cannot shorten the recorded held time', () 
   assert.strictEqual(zero.finish(zero.s.t0 - 400).held_s, zero.s.lastT - zero.s.t0, 'a wildly wrong clock zeroed it');
 });
 
+check('the clear crosses are square, small, and every one of them is covered by the rule', () => {
+  // Not a DOM test: this reads the stylesheet and the markup out of index.html. It exists because a
+  // clear button was once styled by id alone, so a later row's cross fell back to the full-width
+  // green button rule and crushed its field to 22 px on a phone.
+  const css = /<style>([\s\S]*?)<\/style>/.exec(html)[1];
+  const rule = /([^{}]*Clear[^{}]*)\{([^}]*)\}/.exec(css);
+  assert(rule, 'no style rule for the clear buttons');
+  const selector = rule[1], body = rule[2];
+  const decls = new Map(body.split(';').map(d => d.split(':')).filter(d => d.length === 2)
+    .map(([k, v]) => [k.trim(), v.trim()]));
+  const val = prop => decls.get(prop) ?? null;
+  assert.strictEqual(val('width'), val('height'), `clear buttons are ${val('width')} by ${val('height')}, not square`);
+  const px = parseFloat(val('width'));
+  assert(px >= 44 && px <= 56, `${px}px: a cross should stay small but still be a comfortable tap target`);
+  assert(/flex:\s*0 0/.test(body), 'without flex: 0 0 the cross stretches or shrinks with the row');
+  // every clear button in the markup must be covered by that one selector
+  const ids = [...html.matchAll(/<button id="(\w*Clear)"/g)].map(m => m[1]);
+  assert(ids.length >= 3, `only ${ids.length} clear buttons found; the check needs updating`);
+  for (const id of ids) assert(selector.includes('#' + id), `#${id} is not covered by the clear-button rule`);
+});
+
 check('manual finish: held_s counts to last fix, reason manual', () => {
   const core = PaceCore.create();
   replay(core, [[50, 4.4]]);

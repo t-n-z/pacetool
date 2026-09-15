@@ -38,13 +38,13 @@ over cached fixes.
 
 ## Testing without running
 
-- `node test/selfcheck.js`: 21 checks, exits 1 on failure. Covers auto-start with back-dating, the
+- `node test/selfcheck.js`: 22 checks, exits 1 on failure. Covers auto-start with back-dating, the
   asymmetric tone thresholds and glide mapping, the 46 s stop rule with a 15 s stop that must not
   end the run, ramp timeout, the accuracy and ordering gate, dropout freeze, manual finish, km
   splits, clock-offset independence, stillness detection, the tone hold, target-pace entry,
   tolerance independence of the clock, the countdown (including ending when GPS has stopped), the
-  chart geometry and scale, the voice markers and their spoken phrasing, and the GPX fixture at two
-  targets. Several were written by mutation: break the code, watch the check fail, put it back.
+  chart geometry and scale, the voice markers and their spoken phrasing, the clear-button styling,
+  and the GPX fixture at two targets. Several were written by mutation: break the code, watch the check fail, put it back.
 - Simulator in the browser: open `index.html#sim` (1x) or `index.html#sim=10` (10x). Fake GPS with a
   fixed profile: 20 s ramp, 60 s at 4.5 m/s, 20 s at 4.0, 15 s at 5.0, then 2.0 m/s until the
   auto-end. At 10x the run takes about 20 s and exercises every state and tone. The simulator runs
@@ -164,6 +164,11 @@ three independent skeptics told to refute it. 26 findings, 10 survived. What the
 - Target pace entry is digits-only (added 2026-09-15). A phone's numeric keypad has no colon, so
   digits shift in from the right like a stopwatch: 3, 5, 2 gives 3:52, a fourth digit pushes the rest
   left, seconds past 59 carry into minutes, and the cross clears. `PaceCore.paceDigits`.
+- The clear crosses are fixed 48 px squares (2026-09-15): `flex: 0 0 48px` with a matching height, so
+  a row can neither stretch them wide nor shrink them, and 48 px is the smallest comfortable touch
+  target on both platforms. One self-check reads the stylesheet and asserts the rule is square, small,
+  and covers every clear button in the markup, because one of them was once styled by id alone and a
+  later row's cross fell back to the full-width green button rule.
 - The field is re-read on `pageshow` (added 2026-09-15). Browsers restore form values after the
   script runs, which had left the field showing one pace while the run used another.
 - Cadence metronome (added 2026-09-15): opt-in tickbox, default 170 steps per minute, a 30 ms

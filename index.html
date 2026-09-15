@@ -16,9 +16,15 @@
   button { font-size: 1.2rem; padding: 14px; width: 100%; border: 0; border-radius: 10px; background: #2b7; color: #000; font-weight: 700; margin-top: 16px; }
   button.secondary { background: #333; color: #eee; font-weight: 400; font-size: 1rem; padding: 10px; }
   button.danger { background: #c33; color: #fff; }
-  .targetRow { display: flex; gap: 8px; align-items: stretch; }
+  .targetRow { display: flex; gap: 8px; align-items: center; }
   .targetRow input { flex: 1; }
-  #targetClear, #limitClear, #voiceClear { width: 60px; margin: 0; flex: none; background: #333; color: #eee; font-weight: 400; font-size: 1.6rem; padding: 0; }
+  /* Square, and it stays square: fixed both ways, never stretched by the row, never shrunk by a
+     narrow screen. 48px is the smallest comfortable touch target on both platforms. */
+  #targetClear, #limitClear, #voiceClear {
+    width: 48px; height: 48px; aspect-ratio: 1; flex: 0 0 48px; align-self: center;
+    margin: 0; padding: 0; background: #333; color: #eee; font-weight: 400; font-size: 1.5rem;
+    line-height: 1; display: flex; align-items: center; justify-content: center;
+  }
   .row { display: flex; gap: 8px; }
   .row > * { flex: 1; }
   .hint { color: #888; font-size: .85rem; margin-top: 6px; }
