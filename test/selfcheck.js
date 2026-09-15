@@ -42,16 +42,17 @@ check('auto-start: go on 3rd consecutive at-pace fix, t0 back-dated to the first
   console.log(`     go at ${goIdx - 20} s into the hold (ramp is 20 s), t0 = ${core.s.t0 - rec[0].t} s after first fix`);
 });
 
-check('tones: +5% silent, +12% rising, -1% falling, -10% falling every 1 s, +20% rising every 1 s', () => {
-  const c = PaceCore.DEF;
+check('tones: silent inside both tolerances, rising above +10%, falling below -10%, 1 s when far out', () => {
+  const c = PaceCore.DEF;                                  // defaults: 10% either side
   assert.strictEqual(PaceCore.toneFor(0.05, c), null);
+  assert.strictEqual(PaceCore.toneFor(-0.05, c), null, 'inside the slow tolerance must be silent');
+  assert.strictEqual(PaceCore.toneFor(0.0, c), null);
   assert.strictEqual(PaceCore.toneFor(0.12, c).kind, 'rise');
   assert.strictEqual(PaceCore.toneFor(0.12, c).period, 2);
-  assert.strictEqual(PaceCore.toneFor(-0.01, c).kind, 'fall');
-  assert.strictEqual(PaceCore.toneFor(-0.10, c).period, 1);
+  assert.strictEqual(PaceCore.toneFor(-0.12, c).kind, 'fall');
+  assert.strictEqual(PaceCore.toneFor(-0.12, c).period, 1);   // already past the 10% "far out" mark
   assert.strictEqual(PaceCore.toneFor(0.20, c).period, 1);
-  assert.strictEqual(PaceCore.toneFor(0.0, c), null);
-  assert.strictEqual(PaceCore.toneFor(-0.015, { ...c, underTol: 0.02 }), null);
+  assert.strictEqual(PaceCore.toneFor(-0.01, { ...c, underTol: 0 }).kind, 'fall');   // zero tolerance still works
   // glide: 20% off = one octave either side
   assert(Math.abs(PaceCore.glideHz(0.2, c) - 1200) < 1e-6);
   assert(Math.abs(PaceCore.glideHz(-0.2, c) - 300) < 1e-6);
@@ -150,6 +151,51 @@ check('stillness: drifting fixes while standing read as speed 0, walking and run
   for (; t < 1020; t++) { lat += 1.3 / 111000; walk.onFix({ t, lat, lon: -30, speed: 1.3, acc: 8 }, t); }
   assert.strictEqual(walk.s.still, false, 'walking flagged as still');
   assert(walk.s.v > 1.2);
+});
+
+check('tone hold: one stray fix never changes the tone, three consecutive do', () => {
+  const core = PaceCore.create();                      // toneHold 3 by default
+  replay(core, [[20, 4.4], [30, 4.4]]);                // running, silent (between target and +10%)
+  assert.strictEqual(core.s.state, 'RUNNING');
+  assert.strictEqual(core.toneNow(), null, 'tone before any sustained deviation');
+  let t = core.s.lastT;
+  core.onFix({ t: ++t, lat: 60.1, lon: -30, speed: 3.0, acc: 8 }, t);     // one slow fix
+  assert.strictEqual(core.toneNow(), null, 'a single slow fix played a tone');
+  replay(core, [[30, 4.4]], { t0: ++t });                                  // back on pace
+  assert.strictEqual(core.toneNow(), null);
+  const rec = replay(core, [[10, 3.4]], { t0: core.s.lastT + 1 });         // a real fade, 3 fixes in
+  assert.strictEqual(rec[2].v < VT, true);
+  assert.strictEqual(core.toneNow().kind, 'fall', 'sustained slow did not latch the falling tone');
+  const fast = PaceCore.create({ toneHold: 1 });                           // hold 1 = old behaviour
+  replay(fast, [[20, 4.4], [20, 5.6]]);
+  assert.strictEqual(fast.toneNow().kind, 'rise');
+});
+
+check('target entry: digits shift in from the right, seconds past 59 carry into minutes', () => {
+  const t = raw => PaceCore.paceDigits(raw).text;
+  assert.strictEqual(t('3'), '0:03');
+  assert.strictEqual(t('35'), '0:35');
+  assert.strictEqual(t('352'), '3:52');      // 3, 5, 2 typed in order
+  assert.strictEqual(t('3525'), '35:25');    // a fourth digit pushes the rest left
+  assert.strictEqual(t('365'), '4:05');      // 3:65 carries
+  assert.strictEqual(t('3:65'), '4:05');     // whatever is in the field, digits only
+  assert.strictEqual(t('9999'), '99:59');    // clamped, never wraps to a small number
+  assert.strictEqual(t(''), '');
+  assert.strictEqual(PaceCore.paceDigits('').sec, null);
+  assert.strictEqual(PaceCore.paceDigits('352').sec, 232);
+  assert.strictEqual(PaceCore.paceDigits('35').digits, '35');   // re-feeding the text is stable
+  assert.strictEqual(t(PaceCore.paceDigits('352').text), '3:52');
+});
+
+check('a loose tolerance moves the tones only, never the clock or the recorded time', () => {
+  const loose = PaceCore.create({ underTol: 0.10 }), strict = PaceCore.create({ underTol: 0 });
+  const segs = [[10, 2.0], [40, VT * 0.95], [40, VT * 1.02]];   // 40 s just under target, then just over
+  for (const core of [loose, strict]) replay(core, segs);
+  assert.strictEqual(loose.s.t0, strict.s.t0, 'auto-start moved with the tolerance');
+  assert.strictEqual(Math.round(loose.s.onPace), Math.round(strict.s.onPace), 'time on pace moved with the tolerance');
+  assert(loose.s.onPace < 45, `on pace ${loose.s.onPace}s: the 95% segment must not count`);
+  assert.strictEqual(PaceCore.toneFor(-0.05, loose.c), null);          // but the tone is quiet
+  assert.strictEqual(PaceCore.toneFor(-0.05, strict.c).kind, 'fall');
 });
 
 check('manual finish: held_s counts to last fix, reason manual', () => {

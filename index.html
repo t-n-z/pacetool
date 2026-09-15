@@ -16,9 +16,14 @@
   button { font-size: 1.2rem; padding: 14px; width: 100%; border: 0; border-radius: 10px; background: #2b7; color: #000; font-weight: 700; margin-top: 16px; }
   button.secondary { background: #333; color: #eee; font-weight: 400; font-size: 1rem; padding: 10px; }
   button.danger { background: #c33; color: #fff; }
+  .targetRow { display: flex; gap: 8px; align-items: stretch; }
+  .targetRow input { flex: 1; }
+  #targetClear { width: 60px; margin: 0; flex: none; background: #333; color: #eee; font-weight: 400; font-size: 1.6rem; padding: 0; }
   .row { display: flex; gap: 8px; }
   .row > * { flex: 1; }
   .hint { color: #888; font-size: .85rem; margin-top: 6px; }
+  .check { display: flex; align-items: center; gap: 10px; color: #eee; font-size: 1rem; margin: 16px 0 0; }
+  .check input { width: 22px; height: 22px; flex: none; padding: 0; accent-color: #2b7; }
   #run { position: fixed; inset: 0; background: #111; padding: 16px; display: flex; flex-direction: column; user-select: none; touch-action: none; }
   #run.fall { background: #401; } #run.rise { background: #032; } #run.drop { background: #330; }
   .state { font-size: 1.1rem; color: #aaa; text-align: center; }
@@ -40,12 +45,20 @@
 <div id="setup">
   <h1>Pace</h1>
   <label>Target pace (min:sec per km)</label>
-  <input id="target" inputmode="numeric" placeholder="3:52" value="3:52">
+  <div class="targetRow">
+    <input id="target" inputmode="numeric" autocomplete="off" placeholder="3:52" value="3:52">
+    <button id="targetClear" type="button" title="Clear" aria-label="Clear target pace">&times;</button>
+  </div>
+  <div class="hint">Type digits only: 3 then 5 then 2 gives 3:52. Seconds past 59 carry into minutes. The cross clears it.</div>
   <div class="row">
-    <div><label>Slow tolerance %</label><input id="under" inputmode="decimal" value="0"></div>
+    <div><label>Slow tolerance %</label><input id="under" inputmode="decimal" value="10"></div>
     <div><label>Fast threshold %</label><input id="over" inputmode="decimal" value="10"></div>
   </div>
-  <div class="hint">Falling tone when slower than target minus tolerance. Rising tone only when faster than target plus threshold. Silent in between.</div>
+  <div class="hint">Falling tone when slower than target minus tolerance. Rising tone only when faster than target plus threshold. Silent in between. The tolerances move the tones only: the clock still starts at target pace and time on pace still counts only at or above it.</div>
+
+  <label class="check"><input type="checkbox" id="cadOn"> Cadence metronome</label>
+  <div class="row"><div><label>Steps per minute</label><input id="cadSpm" inputmode="numeric" value="170"></div></div>
+  <div class="hint" id="cadHint"></div>
   <button id="start">Start</button>
   <div class="hint">Tap Start, keep the screen on and the phone in hand or on an arm. The clock starts by itself when you reach target pace and stops after about 100 m at half speed.</div>
   <div class="hint" id="support"></div>
@@ -72,12 +85,16 @@ const PaceCore = (() => {
   const DEF = {
     targetSec: 232,   // s per km. 232 = 3:52/km = 4.31 m/s
     tau: 3,           // EMA time constant, s
-    underTol: 0,      // falling tone when dev < -underTol
+    underTol: 0.10,   // falling tone when dev < -underTol. Tones only: the clock and time-on-pace use
+                      // the target itself, so a loose tolerance cannot inflate the recorded result.
     overThr: 0.10,    // rising tone when dev > overThr
     stopF: 0.5, resumeF: 0.6, stopDist: 100,
     accMax: 20, vMax: 8,
     rampTimeout: 60,  // s in RAMP before a warning tone
     dropout: 5,       // s without an accepted fix = data gap, counters frozen
+    toneHold: 3,      // fixes a new tone state must persist before it is played. 1 = react to every fix.
+                      // 3 cuts tone changes at a steady target pace from about 14/min to 5/min without
+                      // slowing a real call. Measured: test/compare-smoothing.js
     stillWindow: 5, stillRadius: 4,   // standing still: every fix in the last 5 s within 4 m of the newest (tune)
     minSemi: 2        // ponytail: glide floor so a 1% miss still sounds directional; 0 = pure spec mapping
   };
@@ -103,6 +120,23 @@ const PaceCore = (() => {
     return 600 * Math.pow(2, s / 12);
   }
 
+  // Stopwatch-style target-pace entry. A phone's numeric keypad has no colon, so digits shift in
+  // from the right: '3','5','2' reads 3:52 and a fourth digit pushes the rest left. Seconds past 59
+  // carry into minutes, so 3:65 becomes 4:05. Pure: takes whatever is in the field, returns what
+  // should be there. {digits, sec, text}.
+  function paceDigits(raw) {
+    let d = String(raw ?? '').replace(/\D/g, '').slice(-4);
+    if (d === '') return { digits: '', sec: null, text: '' };
+    const toSec = x => { const n = x.padStart(3, '0'); return +n.slice(0, -2) * 60 + +n.slice(-2); };
+    if (+d.slice(-2) > 59) {                       // carry, then re-derive the digits from the total
+      const t = toSec(d);
+      d = Math.floor(t / 60) > 99 ? '9959' : Math.floor(t / 60) + String(t % 60).padStart(2, '0');
+    }
+    d = d.replace(/^0+(?=\d{3})/, '');
+    const sec = toSec(d);
+    return { digits: d, sec, text: Math.floor(sec / 60) + ':' + String(sec % 60).padStart(2, '0') };
+  }
+
   function create(opts) {
     const c = Object.assign({}, DEF, opts);
     const VT = 1000 / c.targetSec;
@@ -111,6 +145,7 @@ const PaceCore = (() => {
       state: 'ARMED', v: null, dev: null, lastT: null, lastAccT: null, lastRaw: null,
       t0: null, tSlow0: null, slowS: 0, dist: 0, onPace: 0, fastRun: 0,
       good: 0, atpace: 0, atpaceT: null, rampT0: null, dropped: false, still: false, recent: [],
+      toneKind: null, toneWant: null, toneRun: 0,
       log: [], track: [], result: null
     };
 
@@ -177,17 +212,24 @@ const PaceCore = (() => {
       s.v = s.v == null ? speed : s.v + a * (speed - s.v);
       s.dev = (s.v - VT) / VT;
 
+      // GPS noise crosses the threshold constantly at a steady target pace, so a tone state has to
+      // persist for toneHold fixes before it is heard. Latching, not averaging: a real change still
+      // lands within toneHold seconds, a one-fix wobble is never played.
+      const want = toneFor(s.dev, c), kind = want ? want.kind : null;
+      if (kind === s.toneWant) s.toneRun++; else { s.toneWant = kind; s.toneRun = 1; }
+      if (s.toneRun >= c.toneHold) s.toneKind = kind;
+
       if (s.state === 'ARMED') {
         if (++s.good >= 3) { s.state = 'RAMP'; s.rampT0 = f.t; }
       } else if (s.state === 'RAMP') {
-        if (s.v >= (1 - c.underTol) * VT) {
+        if (s.v >= VT) {                     // auto-start at the target itself, never at the tolerance
           s.atpace++; if (s.atpaceT == null) s.atpaceT = f.t;
           if (s.atpace >= 3) { s.t0 = s.atpaceT; s.state = 'RUNNING'; ev.push('go'); }
         } else { s.atpace = 0; s.atpaceT = null; }
         if (s.state === 'RAMP' && f.t - s.rampT0 >= c.rampTimeout) { ev.push('warn'); s.rampT0 = f.t; }
       } else if (s.state === 'RUNNING') {
         s.dist += s.v * dt;
-        if (s.dev >= -c.underTol) s.onPace += dt;
+        if (s.v >= VT) s.onPace += dt;       // time on pace means at or above target, tolerance aside
         if (s.v <= c.stopF * VT) {
           if (s.tSlow0 == null) s.tSlow0 = f.t;
           s.slowS += dt; s.fastRun = 0;
@@ -208,11 +250,15 @@ const PaceCore = (() => {
       return null;
     }
 
-    return { s, c, VT, STOP_S, onFix, tick, finish: (t) => finish(t, 'manual'),
+    // What to play now: the confirmed kind, at the repeat period the current deviation asks for.
+    const toneNow = () => s.toneKind == null ? null
+      : { kind: s.toneKind, period: toneFor(s.dev, c)?.period ?? 2 };
+
+    return { s, c, VT, STOP_S, onFix, tick, finish: (t) => finish(t, 'manual'), toneNow,
              tone: (dev) => toneFor(dev, c), glideHz: (dev) => glideHz(dev, c) };
   }
 
-  return { create, haversine, toneFor, glideHz, DEF };
+  return { create, haversine, toneFor, glideHz, paceDigits, DEF };
 })();
 if (typeof module !== 'undefined') module.exports = PaceCore;
 </script>
@@ -225,10 +271,32 @@ if (typeof module !== 'undefined') module.exports = PaceCore;
 
   // ---- settings
   const cfg = JSON.parse(localStorage.getItem(LSCFG) || '{}');
-  if (cfg.target) $('target').value = cfg.target;
   if (cfg.under != null) $('under').value = cfg.under;
   if (cfg.over != null) $('over').value = cfg.over;
+  if (cfg.cad != null) $('cadOn').checked = !!cfg.cad;
+  if (cfg.spm != null) $('cadSpm').value = cfg.spm;
   const parseTarget = str => { const m = /^(\d+):(\d{1,2})$/.exec(str.trim()); return m ? +m[1] * 60 + +m[2] : null; };
+
+  // ---- target pace entry.
+  // The phone's numeric keypad has no colon, so digits shift in from the right like a stopwatch:
+  // 3, 5, 2 reads 3:52, and a fourth digit pushes everything left. Seconds past 59 carry into
+  // minutes as they are typed (3:65 becomes 4:05). Backspace removes a digit, the cross clears.
+  let tSec = null;
+  function setDigits(raw) {
+    const r = PaceCore.paceDigits(raw);
+    tSec = r.sec;
+    const el = $('target');
+    el.value = r.text;
+    if (document.activeElement === el) el.setSelectionRange(el.value.length, el.value.length);
+  }
+  const targetSecNow = () => tSec;
+  $('target').addEventListener('input', e => setDigits(e.target.value));
+  $('targetClear').addEventListener('click', () => { setDigits(''); $('target').focus(); });
+  setDigits(cfg.target || '3:52');
+  // A browser restores form fields after this script runs (reload, back button), which would leave
+  // the field showing one pace while the run used another. Re-read the field so what is displayed is
+  // always what starts. Observed on a desktop reload, 2026-09-15.
+  addEventListener('pageshow', () => setDigits($('target').value || cfg.target || '3:52'));
   const fmtPace = sPerKm => !isFinite(sPerKm) || sPerKm > 1800 ? '--:--' : `${Math.floor(sPerKm / 60)}:${String(Math.round(sPerKm % 60)).padStart(2, '0')}`;
   const fmtT = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
 
@@ -254,10 +322,29 @@ if (typeof module !== 'undefined') module.exports = PaceCore;
   const endTone = () => { note(660, 0.4, now()); note(523, 0.4, now() + 0.45); note(392, 0.7, now() + 0.9); };
   const softTick = () => note(1000, 0.02, now(), 0.08);
 
+  // ---- cadence metronome. A buzz where the phone can buzz (Android), a click where it cannot
+  // (iOS Safari has no Vibration API), so the cue exists on both. Self-correcting schedule: each
+  // tick is placed against the start time, so it cannot drift over a 12-minute run.
+  const canBuzz = typeof navigator.vibrate === 'function';
+  let cadTimer = null;
+  function cadenceStart(spm) {
+    const period = 60000 / Math.max(40, Math.min(260, spm));
+    const t0 = performance.now(); let n = 1;
+    const tick = () => {
+      if (canBuzz) navigator.vibrate(30); else note(1400, 0.015, now(), 0.12);
+      cadTimer = setTimeout(tick, Math.max(0, t0 + ++n * period - performance.now()));
+    };
+    cadTimer = setTimeout(tick, period);
+  }
+  function cadenceStop() { clearTimeout(cadTimer); cadTimer = null; if (canBuzz) navigator.vibrate(0); }
+  $('cadHint').textContent = canBuzz
+    ? 'A short buzz on every step. Default 170 steps per minute.'
+    : 'This phone has no vibration for web pages, so the metronome clicks instead. Default 170 steps per minute.';
+
   function toneLoop() {
     const s = core.s, t = now();
     let tone = null;
-    if (s.state === 'RUNNING' && !s.dropped && s.dev != null) tone = core.tone(s.dev);
+    if (s.state === 'RUNNING' && !s.dropped && s.dev != null) tone = core.toneNow();
     $('run').className = s.dropped ? 'drop' : tone ? tone.kind : '';
     if (tone) { if (t - lastGlide >= tone.period) { glide(s.dev); lastGlide = t; lastTick = t; } }
     else if (s.state !== 'END' && !s.dropped && t - lastTick >= 4) { softTick(); lastTick = t; }
@@ -283,16 +370,19 @@ if (typeof module !== 'undefined') module.exports = PaceCore;
 
   // ---- run lifecycle
   function start() {
-    const targetSec = parseTarget($('target').value);
-    if (!targetSec) { alert('Target pace as min:sec, for example 3:52'); return; }
+    const targetSec = targetSecNow();
+    if (!targetSec || targetSec < 90 || targetSec > 1800) { alert('Target pace between 1:30 and 30:00 per km. Type digits: 3 5 2 gives 3:52.'); return; }
     const underTol = Math.max(0, +$('under').value || 0) / 100, overThr = Math.max(0, +$('over').value || 0) / 100;
-    localStorage.setItem(LSCFG, JSON.stringify({ target: $('target').value.trim(), under: $('under').value, over: $('over').value }));
+    const spm = Math.max(40, Math.min(260, +$('cadSpm').value || 170));
+    localStorage.setItem(LSCFG, JSON.stringify({ target: $('target').value, under: $('under').value,
+      over: $('over').value, cad: $('cadOn').checked, spm }));
     core = PaceCore.create({ targetSec, underTol, overThr });
 
     ctx = ctx || new (window.AudioContext || window.webkitAudioContext)();
     if ('audioSession' in navigator) { try { navigator.audioSession.type = 'playback'; } catch (e) {} }  // iOS silent switch
     ctx.resume(); lastGlide = lastTick = 0;
     lock();
+    if ($('cadOn').checked) cadenceStart(spm);
     if (sim) sim.start(onPosition);
     else watchId = navigator.geolocation.watchPosition(onPosition, onError, { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 });   // maximumAge 0: no cached fixes
 
@@ -303,7 +393,7 @@ if (typeof module !== 'undefined') module.exports = PaceCore;
 
   function stopRun() {
     if (core.s.state !== 'END') core.finish(wall());
-    clearInterval(uiTimer); clearInterval(toneTimer);
+    clearInterval(uiTimer); clearInterval(toneTimer); cadenceStop();
     if (sim) sim.stop(); else navigator.geolocation.clearWatch(watchId);
     wakeLock?.release(); wakeLock = null;
     saveRun(core.s.result);
